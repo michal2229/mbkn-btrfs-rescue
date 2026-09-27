@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Fedora: a recent btrfs-progs (mkfs.btrfs --rootdir with subvolumes) for the test images
+    container: fedora:latest
+    steps:
+      - name: System packages
+        run: dnf install -y --setopt=install_weak_deps=False btrfs-progs fuse3 fuse3-libs git
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: uv sync --all-extras
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Tests (the kernel FUSE mount test skips without /dev/fuse)
+        run: uv run pytest -q

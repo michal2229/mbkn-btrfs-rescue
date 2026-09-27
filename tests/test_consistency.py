@@ -159,6 +159,24 @@ def test_expected_categories(scenario):
     assert f"{proj}/link" in walked["intact"][0]
 
 
+def test_review_lists_damaged_files_with_their_bad_ranges(scenario, capsys):
+    _tmp, _img, _db, _files, base, work = scenario
+    capsys.readouterr()
+    assert main([*base, "review"]) == 0
+    out = capsys.readouterr()
+    rows = [line.split("\t") for line in out.out.splitlines()]
+    assert rows[0][:3] == ["path", "category", "size"]
+    by_path = {r[0]: r for r in rows[1:]}
+    big = by_path[f"/{work}/proj/pkg/big.txt"]
+    assert big[1] == "damaged" and big[3] == "4096" and big[6] == "0-4096"
+    # lost files and files whose best version is fine are not listed
+    assert f"/{work}/proj/pkg/rand.bin" not in by_path
+    assert f"/{work}/proj/main.py" not in by_path
+    assert "1 damaged" in out.err
+    assert main([*base, "review", f"/{work}/proj/pkg", "--include", "lost"]) == 0
+    assert f"/{work}/proj/pkg/rand.bin" in capsys.readouterr().out
+
+
 def test_all_hides_exactly_the_lost_files(scenario):
     _tmp, img, db, _files, _base, _work = scenario
     ops = _ops(img, db)
@@ -425,3 +443,44 @@ def test_unchecksummed_compressed_garbage_is_lost(tmp_path):
     assert fs.file_check(tree, ino)[0] == "damaged"  # first extent garbage, rest decodes
     main_py = _ino(con, tree, "main.py")
     assert fs.file_check(tree, main_py)[0] == "intact"  # inline
+
+
+def test_restore_fill_older_fills_bad_ranges_from_an_older_version(indexed):
+    """Newest version: first sector bad. Older version: good there, bad in the middle."""
+    tmp, img, db, files, base = indexed
+    con = connect(db)
+    fs = RescueFS(con, Device(str(img)))
+    work = next(n for n in fs.children(ROOT) if n.startswith("_work@"))
+    tree = int(work.split("@")[1])
+    ino = _ino(con, tree, "big.txt")
+    row = fs.layout(tree, ino).segments[0][2]
+    assert row.comp == 0 and row.nbytes > 16 * 4096
+    with img.open("r+b") as fh:  # test image only: older version bad in sectors 10-12
+        fh.seek(fs.map_logical(row.disk_bytenr)[0] + 10 * 4096)
+        fh.write(b"\xff" * 3 * 4096)
+    cols = [d[0] for d in con.execute("SELECT * FROM extents LIMIT 0").description]
+    c = {n: i for i, n in enumerate(cols)}
+    old = list(
+        con.execute(
+            "SELECT * FROM extents WHERE tree=? AND ino=? AND foff=0", (tree, ino)
+        ).fetchone()
+    )
+    newer = old[c["gen_max"]] + 1000
+    for foff, bytenr in ((0, 1 << 50), (10 * 4096, 0)):  # unmapped sector; hole over 10-12
+        r = list(old)
+        r[c["foff"]], r[c["egen"]], r[c["gen_min"]], r[c["gen_max"]] = foff, newer, newer, newer
+        r[c["disk_bytenr"]], r[c["eoff"]] = bytenr, 0
+        r[c["disk_len"]] = r[c["ram_bytes"]] = 4096 if bytenr else 3 * 4096
+        r[c["nbytes"]] = r[c["disk_len"]]
+        con.execute(f"INSERT INTO extents VALUES ({','.join('?' * len(cols))})", r)
+    con.commit()
+    assert main([*base, "classify", "--no-match"]) == 0
+    fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
+    assert fs.best_version(tree, ino) == (None, "damaged")  # newest: 1 bad sector, older: 3
+    out = tmp / "filled"
+    assert main([*base, "restore", "--fill-older", f"/{work}/proj/pkg/big.txt", str(out)]) == 1
+    want = bytearray(files["_work/proj/pkg/big.txt"])
+    want[10 * 4096 : 13 * 4096] = bytes(3 * 4096)  # the newer version's hole
+    assert (out / "big.txt").read_bytes() == bytes(want)
+    report = next(out.glob(".mbkn-restore-*.tsv")).read_text()
+    assert "filled from older versions: 0-4096@" in report

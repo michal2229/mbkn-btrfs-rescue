@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+### Recovery
+- **Copies** (`match`, issue #1): every device sector is hashed once (cached); bad sectors
+  whose expected checksum is found right next to their neighbour's are read from that copy,
+  sectors whose checksum is that of zeros come back as zeros. Runs in `classify`, `analyze`
+  and `mount` by default (`--no-match`). Chance crc32c matches are never used.
+- **`git-rescue`** (#3): lost/damaged files of git work trees from the index, stash or HEAD,
+  compared with the lost file's checksums (`verified` = byte-identical); report and
+  `--dest` to write them. The restored repository never runs hooks or config commands.
+- **`review`** (#4): TSV of unverified and damaged files with bad/unverifiable byte ranges.
+- **`restore --fill-older`** (#2): fills bad ranges of damaged files from older versions,
+  listing each filled range in the report. (Identical content of other versions is used
+  automatically by `match`.)
+
+### Other
+- CI on GitHub Actions (#5): lint + tests in a Fedora container.
+- `stat` shows sectors recovered from copies per extent.
+
+### Upgrading from 0.2
+Indexes are migrated in place. `mount` (or `classify`) runs the copy search once; hashing the
+device takes a few minutes and needs `4 bytes x sectors` of cache space (500 MB per 500 GB).
+
 ## 0.2.0
 
 First release on `main` (0.1 was only developed on the `init` branch).

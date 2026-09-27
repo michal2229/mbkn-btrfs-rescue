@@ -12,8 +12,13 @@ tree bottom-up from the leaves, and lets you:
   while the analysis is still running,
 * **classify** every file as intact / unverified / damaged / lost by checking btrfs data
   checksums sector by sector (and, where no checksum survives, whether the data is plausible),
+* **recover bad sectors from identical copies** elsewhere on the disk (plain copies of files,
+  other subvolumes, DUP mirrors, old locations), found by their expected checksums,
 * get the **best version** of every file automatically: the newest one, or an older one when
   the newest is broken (`best/` in the mount, default for `restore`),
+* bring back **lost source files from git**: staged, stashed or committed content of lost
+  work-tree files, verified against the lost file's checksums (`git-rescue`),
+* **review** what needs a human look: unverified and damaged files with their bad byte ranges,
 * **restore** only what is salvageable (by default), with a report,
 * go back to **any older version** of files (`history/gen-N/`, `--at-gen`),
 * skip noise like `.venv` / `.venv-tools` (configurable).
@@ -51,10 +56,22 @@ itself while the analysis runs; category folders fill in when classification fin
 Without FUSE, or step by step:
 
 ```bash
-uv run mbkn-btrfs-rescue analyze                     # scan + extract + classify, resumable
+uv run mbkn-btrfs-rescue analyze                     # scan + extract + classify + match, resumable
 uv run mbkn-btrfs-rescue shell                       # ls / cd / find / grep / stat / restore
 uv run mbkn-btrfs-rescue restore /_work@260/proj ~/recovered   # best versions, good files only
+uv run mbkn-btrfs-rescue git-rescue /_work@260 --dest ~/recovered-git   # lost files from .git
+uv run mbkn-btrfs-rescue review -o ~/review.tsv      # what to check by hand
 ```
+
+### Getting the most back
+
+1. `best/` (or `restore`) - verified content, older versions where the newest broke, and bad
+   sectors already replaced from identical copies found on the disk.
+2. `git-rescue` - lost files of git work trees from the index, the stash or HEAD. `verified`
+   rows are byte-identical to the lost file; others are the last committed/staged version.
+3. `review` - unverified and damaged files with the exact bad byte ranges; for damaged files,
+   `restore --fill-older` fills those ranges from older versions (marked in the report).
+4. `lost/` - what existed (names, sizes, dates), to know what to recreate.
 
 ### Copy from `best/` or use `restore`?
 

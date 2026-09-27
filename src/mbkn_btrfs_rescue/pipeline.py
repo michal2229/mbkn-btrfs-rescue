@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from .classify import classify_extents, classify_files
 from .compat import device_warnings
@@ -38,7 +39,7 @@ def classification_outdated(con: sqlite3.Connection, exclude: list[str]) -> bool
     """True when stored checks/categories were made by older rules or another exclude list."""
     return int(get_meta(con, "check_version", "1")) < CHECK_VERSION or get_meta(
         con, "classify_exclude"
-    ) != classify_key(exclude)
+    ) != classify_key(exclude, get_meta(con, "patch_serial", ""))
 
 
 def _status(con: sqlite3.Connection, text: str, echo: bool) -> None:
@@ -87,6 +88,7 @@ def analyze(
     quick: bool = False,
     echo: bool = True,
     stop: Callable[[], bool] | None = None,
+    match_dir: Path | None = None,
 ) -> str:
     """Run the remaining stages. Returns the final state."""
     state = get_meta(con, STATE_KEY) or "scanning"
@@ -128,6 +130,11 @@ def analyze(
         fs = RescueFS(con, dev, exclude=exclude)
         _status(con, "classifying: checking data extents", echo)
         classify_extents(fs, quick=quick, progress=echo, report=lambda m: _status(con, m, False))
+        if match_dir is not None and not quick:
+            from .match import run_match
+
+            _status(con, "classifying: recovering bad sectors from copies", echo)
+            run_match(fs, match_dir, progress=echo, report=lambda m: _status(con, m, False))
         _status(con, "classifying: categorising files", echo)
         classify_files(fs, progress=echo)
         set_meta(con, STATE_KEY, "complete")

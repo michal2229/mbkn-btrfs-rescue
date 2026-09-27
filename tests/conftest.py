@@ -49,11 +49,13 @@ def make_tree(root: Path) -> dict[str, bytes]:
     return files
 
 
-def build_image(tmp: Path, compress: str = "no", nodesize: int = 16384) -> tuple[Path, dict]:
+def build_image(
+    tmp: Path, compress: str = "no", nodesize: int = 16384, maker=make_tree
+) -> tuple[Path, dict]:
     if MKFS is None:
         pytest.skip("mkfs.btrfs not available")
     src = tmp / "src"
-    files = make_tree(src)
+    files = maker(src)
     img = tmp / "fs.img"
     with img.open("wb") as fh:
         fh.truncate(512 << 20)

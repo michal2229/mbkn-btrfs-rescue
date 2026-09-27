@@ -9,6 +9,7 @@ from __future__ import annotations
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from .db import get_meta, set_meta
 from .model import CATEGORIES, CHECK_VERSION, ROOT_INO, DataError, Node, RescueFS
@@ -68,8 +69,8 @@ def classify_extents(
     done_bytes = 0
     batch = []
     for i, (_phys, b, n, g, comp) in enumerate(todo, 1):
-        c = fs.check_extent(b, n, g, quick=quick, refresh=True, comp=comp)
-        batch.append((b, n, g, *c))
+        c = fs.check_extent_raw(b, n, g, quick=quick, comp=comp)
+        batch.append((b, n, g, *c[:6]))
         done_bytes += n
         now = time.monotonic()
         if len(batch) >= 5000 or i == len(todo) or now - last > 2:
@@ -118,11 +119,33 @@ def classify_files(fs: RescueFS, progress: bool = True) -> dict[str, tuple[int, 
     return view.category_totals()
 
 
+def print_match(stats: dict[str, int]) -> None:
+    print(
+        f"copies: {stats['copied']} bad sectors recovered from confirmed copies, "
+        f"{stats['zero']} known to be zeros (of {stats['bad']} bad sectors; "
+        f"{stats['unconfirmed']} with unconfirmed chance matches ignored, "
+        f"{stats['no_csum']} without an expected checksum)",
+        file=sys.stderr,
+    )
+
+
 def classify(
-    fs: RescueFS, trees: set[int] | None = None, quick: bool = False, progress: bool = True
+    fs: RescueFS,
+    trees: set[int] | None = None,
+    quick: bool = False,
+    progress: bool = True,
+    match_dir: Path | None = None,
 ) -> dict[str, tuple[int, int]]:
+    """Check extents, then (with `match_dir`: the sector-hash cache) recover bad sectors from
+    copies, then categorise files."""
     n, total = classify_extents(fs, trees, quick, progress)
     if progress:
         print(f"checked {n} extents ({total / 2**30:.1f} GiB)", file=sys.stderr)
+    if match_dir is not None and not quick:
+        from .match import run_match
+
+        stats = run_match(fs, match_dir, progress)
+        if progress:
+            print_match(stats)
     totals = classify_files(fs, progress)
     return {c: totals.get(c, (0, 0)) for c in CATEGORIES}

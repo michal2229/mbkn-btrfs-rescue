@@ -243,6 +243,8 @@ def _categories_from_args(args) -> frozenset[str]:
     cats = set(DEFAULT_CATEGORIES)
     for item in args.include or []:
         cats |= set(CATEGORIES) if item == "all" else {item}
+    if getattr(args, "fill_older", False):
+        cats.add("damaged")
     return frozenset(cats)
 
 
@@ -274,15 +276,67 @@ def cmd_restore(args, cfg):
             overwrite=args.overwrite,
             include_stale=args.include_stale,
             best=not args.latest,
+            fill_older=args.fill_older,
         )
         print(
             f"wrote {stats.files} files ({fmt_size(stats.bytes)}), {stats.links} symlinks, "
-            f"{stats.older_versions} from an older (better) version; "
+            f"{stats.older_versions} from an older (better) version, "
+            f"{stats.filled} damaged files filled from older versions; "
             f"skipped {stats.skipped_category} by category, {stats.skipped} already existing"
         )
         print(f"categories seen: {stats.by_category}  (written: {', '.join(sorted(cats))})")
         print(f"report: {report}")
     return 1 if stats.problems else 0
+
+
+def cmd_review(args, cfg):
+    import contextlib
+
+    from .model import ROOT
+    from .review import DEFAULT_REVIEW, review
+
+    cats = tuple(args.include.split(",")) if args.include else DEFAULT_REVIEW
+    counts: dict[str, int] = {}
+    with _device(args, cfg) as dev, contextlib.ExitStack() as stack:
+        fs = _open_fs(args, cfg, dev)
+        if not fs.masks_valid():
+            raise SystemExit("not classified (or classified with other rules) - run `classify`")
+        chain = fs.resolve(args.path)
+        if chain:
+            starts = [(fs.chain_path(chain), chain[-1])]
+        else:  # the root: every subvolume
+            starts = [(f"/{name}", e) for name, e in fs.children(ROOT).items()]
+        out = sys.stdout
+        if args.output:
+            out = stack.enter_context(open(args.output, "w", newline=""))
+        for i, (rel, e) in enumerate(starts):
+            found = review(fs, e, rel, out, cats, best=not args.latest, header=i == 0)
+            for cat, n in found.items():
+                counts[cat] = counts.get(cat, 0) + n
+    summary = ", ".join(f"{n} {c}" for c, n in sorted(counts.items())) or "nothing to review"
+    print(summary + (f" -> {args.output}" if args.output else ""), file=sys.stderr)
+    return 0
+
+
+def cmd_git_rescue(args, cfg):
+    from .gitrescue import git_rescue
+
+    with _device(args, cfg) as dev:
+        fs = _open_fs(args, cfg, dev)
+        if not fs.masks_valid():
+            raise SystemExit("not classified (or classified with other rules) - run `classify`")
+        dest = Path(args.dest).expanduser() if args.dest else None
+        stats, report = git_rescue(fs, args.path, dest, scratch=cfg.tmp_dir)
+    print(
+        f"{stats.repos} repositories with lost/damaged files, {stats.files} files: "
+        f"{stats.verified} verified identical, {stats.same_size} same size, "
+        f"{stats.other} other version, {stats.object_lost} with their git object lost too, "
+        f"{stats.untracked} not tracked; "
+        f"sources {stats.by_source}"
+        + (f"; wrote {stats.written} -> {dest} (report: {report})" if dest else ""),
+        file=sys.stderr,
+    )
+    return 0
 
 
 def cmd_classify(args, cfg):
@@ -292,10 +346,25 @@ def cmd_classify(args, cfg):
     with _device(args, cfg) as dev:
         fs = _open_fs(args, cfg, dev)
         trees = {int(t) for t in args.trees.split(",")} if args.trees else None
-        totals = classify(fs, trees=trees, quick=args.quick)
+        match_dir = None if args.no_match or trees else _db(args, cfg)[1].parent
+        totals = classify(fs, trees=trees, quick=args.quick, match_dir=match_dir)
         if get_meta(fs.con, "scan_done") == "1":
             fs.con.execute("INSERT OR REPLACE INTO meta VALUES (?, 'complete')", (STATE_KEY,))
             fs.con.commit()
+    _print_totals(totals)
+    return 0
+
+
+def cmd_match(args, cfg):
+    from .classify import classify_files, print_match
+    from .match import run_match
+
+    with _device(args, cfg) as dev:
+        fs = _open_fs(args, cfg, dev)
+        if not fs.con.execute("SELECT 1 FROM extent_status LIMIT 1").fetchone():
+            raise SystemExit("no checked extents yet - run `classify` first")
+        print_match(run_match(fs, _db(args, cfg)[1].parent))
+        totals = classify_files(fs)
     _print_totals(totals)
     return 0
 
@@ -309,7 +378,14 @@ def cmd_analyze(args, cfg):
         fsid = bytes.fromhex(args.fsid.replace("-", "")) if args.fsid else None
         print(f"analyzing {dev.path} -> {path} (resumable; Ctrl-C to pause)", file=sys.stderr)
         params = prepare(dev, con, fsid=fsid, restart=args.restart)
-        analyze(dev, con, params, exclude=_exclude(args, cfg), quick=args.quick)
+        analyze(
+            dev,
+            con,
+            params,
+            exclude=_exclude(args, cfg),
+            quick=args.quick,
+            match_dir=None if args.no_match else path.parent,
+        )
         _print_totals(RescueFS(con, dev, exclude=_exclude(args, cfg)).category_totals())
     return 0
 
@@ -335,8 +411,9 @@ def cmd_mount(args, cfg):
     if (
         not args.no_analyze
         and analysis_state(con) == "complete"
-        and classification_outdated(con, exclude)
-    ):  # new rules (after an upgrade) or another exclude list: classify again, live
+        and (classification_outdated(con, exclude) or get_meta(con, "patch_serial") is None)
+    ):  # new rules (after an upgrade), another exclude list, no copy search yet: classify
+        # again, live
         set_meta(con, STATE_KEY, "classifying")
         con.commit()
     if not args.no_analyze and analysis_state(con) != "complete":
@@ -347,7 +424,14 @@ def cmd_mount(args, cfg):
             wcon = connect(db_path)
             with Device(dev.path) as wdev, log_path.open("a") as log:
                 try:
-                    analyze(wdev, wcon, params, exclude=exclude, echo=False)
+                    analyze(
+                        wdev,
+                        wcon,
+                        params,
+                        exclude=exclude,
+                        echo=False,
+                        match_dir=db_path.parent,
+                    )
                 except Exception as err:
                     set_meta(wcon, STATUS_KEY, f"ERROR: {err!r} (see {log_path})")
                     wcon.commit()
@@ -469,14 +553,43 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--fsid", help="filesystem UUID (default: from the superblock)")
     s.add_argument("--quick", action="store_true", help="sample 3 sectors per extent")
     s.add_argument("--restart", action="store_true", help="discard previous progress")
+    s.add_argument("--no-match", action="store_true", help="skip recovery from copies")
     view_opts(s)
     s.set_defaults(func=cmd_analyze)
 
     s = sub.add_parser("classify", help="pass 3: verify data and categorise every file")
     s.add_argument("--trees", help="comma-separated fs tree ids to check (default: all)")
     s.add_argument("--quick", action="store_true", help="sample 3 sectors per extent")
+    s.add_argument("--no-match", action="store_true", help="skip recovery from copies")
     view_opts(s)
     s.set_defaults(func=cmd_classify)
+
+    s = sub.add_parser(
+        "git-rescue", help="recover lost/damaged files of git work trees from .git (TSV)"
+    )
+    s.add_argument("path", nargs="?", default="/", help="directory to look for repositories in")
+    s.add_argument("--dest", help="write the recovered files here (default: report only)")
+    view_opts(s)
+    s.set_defaults(func=cmd_git_rescue)
+
+    s = sub.add_parser(
+        "review", help="list unverified and damaged files with their bad byte ranges (TSV)"
+    )
+    s.add_argument("path", nargs="?", default="/", help="directory or file (default: all)")
+    s.add_argument("-o", "--output", help="write the TSV here instead of stdout")
+    s.add_argument(
+        "--include",
+        help="comma-separated categories to list (default: unverified,damaged)",
+    )
+    s.add_argument("--latest", action="store_true", help="judge the newest versions, not best")
+    view_opts(s)
+    s.set_defaults(func=cmd_review)
+
+    s = sub.add_parser(
+        "match", help="pass 4: recover bad sectors from identical copies on the device"
+    )
+    view_opts(s)
+    s.set_defaults(func=cmd_match)
 
     s = sub.add_parser("restore", help="copy a file or directory out")
     s.add_argument("path", help="path in the recovered namespace, e.g. /_work@257/proj")
@@ -495,6 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--latest",
         action="store_true",
         help="always write the newest version (default: best version, as in the mount's best/)",
+    )
+    s.add_argument(
+        "--fill-older",
+        action="store_true",
+        help="damaged files: fill bad ranges with good data of older versions (may be older "
+        "content; listed in the report). Implies --include damaged",
     )
     view_opts(s)
     s.set_defaults(func=cmd_restore)

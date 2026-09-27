@@ -70,8 +70,23 @@ they actually use, and the best version of each damaged/lost file is looked up (
 what is new, then recomputes the categories (seconds to a minute). After upgrading the tool,
 `classify` re-checks exactly the extents whose rules changed and migrates the index.
 
-**Shortcut:** `uv run mbkn-btrfs-rescue analyze` runs scan → extract → classify, resumable,
-extracting leaves incrementally while scanning.
+`classify` then runs `match` (below) unless `--no-match`.
+
+## 3c. Match: bad sectors from identical copies (pass 4)
+
+```
+uv run mbkn-btrfs-rescue match
+```
+
+Hashes every sector of the device once (about 1.3 GiB/s, cached as
+`<cache_dir>/sector-hashes-*.npy`, 4 bytes per sector: 500 MB for a 500 GB disk; resumable)
+and looks up the expected checksum of every bad sector among them. A copy is used only when it
+is confirmed by its neighbour (see [how-it-works.md](how-it-works.md#copies)); sectors whose
+expected checksum is that of zeros come back as zeros. Then categories are recomputed. Runs
+automatically in `classify`, `analyze` and `mount`; takes a few minutes on a 500 GB disk.
+
+**Shortcut:** `uv run mbkn-btrfs-rescue analyze` runs scan → extract → classify → match,
+resumable, extracting leaves incrementally while scanning (`--no-match` to skip the last).
 
 ## 4. Browse
 
@@ -174,6 +189,40 @@ and, for older versions, the generation used.
 Copying from the mount's `best/` gives the same bytes; see the README for when to prefer
 which.
 
+`--fill-older` also writes damaged files and fills their bad ranges with good data from older
+versions (newest first). That content can be older than the rest of the file - useful for text
+and code, where an older paragraph beats garbage; the report lists every filled range as
+`start-end@generation`.
+
+## 6. Review list
+
+```
+uv run mbkn-btrfs-rescue review                      # TSV to stdout, whole disk
+uv run mbkn-btrfs-rescue review /_work@257 -o ~/review.tsv
+uv run mbkn-btrfs-rescue review --include damaged,unverified,lost
+```
+
+One row per file (best version, as `best/` shows it; `--latest` for the newest): path,
+category, size, bad and unverifiable byte counts, version, the byte ranges (`start-end`, up to
+20 each) and the classification detail. Directories without such files are skipped, so a
+whole-disk review takes seconds.
+
+## 7. Lost files from git repositories
+
+```
+uv run mbkn-btrfs-rescue git-rescue /_work@257                       # report only (TSV)
+uv run mbkn-btrfs-rescue git-rescue /_work@257 --dest ~/recovered-git  # also write files
+```
+
+For each git work tree with lost or damaged files, the readable part of its `.git` is restored
+to a scratch directory under `tmp_dir`, and the blobs recorded for each such file are read with
+`git`: from the **index** (staged), the latest **stash**, and **HEAD**. Each blob is compared
+with the lost file's recorded btrfs checksums: `verified` means byte-identical to the lost
+version; otherwise the report says `same size` or `size differs` (an older version). Files are
+written to `DEST/<subvol>@<id>/path` (never overwriting); report
+`DEST/.mbkn-git-rescue-<timestamp>.tsv`. Needs `git`. The restored repository cannot run
+anything: its config is replaced by a minimal one and hooks are not restored.
+
 Restore to a **different disk** than the one being recovered.
 
 ## Typical session for "recover my code, skip virtualenvs"
@@ -183,4 +232,6 @@ scripts/device-access.sh grant
 uv run mbkn-btrfs-rescue mount ~/rescue
 # browse ~/rescue/best/_work@257/... in a file manager, copy what you need, or:
 uv run mbkn-btrfs-rescue restore /_work@257 ~/recovered      # everything good, with a report
+uv run mbkn-btrfs-rescue git-rescue /_work@257 --dest ~/recovered-git   # lost code from git
+uv run mbkn-btrfs-rescue review /_work@257 -o ~/review.tsv   # what is left to check
 ```

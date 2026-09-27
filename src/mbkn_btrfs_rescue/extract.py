@@ -67,6 +67,8 @@ def prepare_extract(
     con.execute("DELETE FROM meta WHERE key LIKE 'classify_%'")
     if get_meta(con, "fsid") != fsid.hex():
         con.execute("DELETE FROM extent_status")
+        con.execute("DELETE FROM sector_patch")
+        con.execute("DELETE FROM meta WHERE key = 'patch_serial'")
     set_meta(con, "fsid", fsid.hex())
     for sb in superblocks or []:
         if sb.valid_magic and sb.header_fsid == fsid:

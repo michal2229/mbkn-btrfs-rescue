@@ -47,7 +47,7 @@ CAT_BITS = {c: 1 << i for i, c in enumerate(CATEGORIES)}
 CAT_RANK = {c: i for i, c in enumerate(CATEGORIES)}  # lower = better content
 GOOD_CATS = (CAT_INTACT, CAT_UNVERIFIED)
 BEST_BIT = 1 << len(CATEGORIES)  # mask bit: something readable in the best/ view
-MASK_VERSION = 6  # bump when mask semantics change (forces re-classification)
+MASK_VERSION = 7  # bump when mask semantics change (forces re-classification)
 MAX_VERSIONS = 64  # older versions tried per file when looking for better content
 CAT_HELP = {
     CAT_INTACT: "content verified against btrfs checksums (or stored inline in metadata)",
@@ -133,6 +133,9 @@ SECTOR_OK, SECTOR_BAD, SECTOR_NOCSUM = 0, 1, 2
 # 2: per-sector states; sectors without a checksum that read as all zeros count as bad.
 # 3: unchecksummed compressed extents that fail to decompress count as bad.
 CHECK_VERSION = 3
+# Kinds of sector patches (see match.py): read the sector from a confirmed identical copy
+# elsewhere on the device, or as zeros (its expected checksum is that of an all-zero sector).
+PATCH_NONE, PATCH_COPY, PATCH_ZERO = 0, 1, 3
 
 
 class ExtentCheck(NamedTuple):
@@ -142,6 +145,7 @@ class ExtentCheck(NamedTuple):
     zero: int
     mapped: int
     sectors: bytes | None = None  # zlib-compressed per-sector states when not uniform
+    copied: int = 0  # bad sectors replaced from copies (not stored: patches are applied on load)
 
     @property
     def uniform(self) -> bool:
@@ -219,6 +223,8 @@ class RescueFS:
         self._csum_leaves = _LRU(512)
         self._csum_index: _CsumIndex | None = None
         self._ext_status: dict[tuple[int, int, int], ExtentCheck] | None = None
+        self._patch_rows: dict[tuple[int, int, int], bytes] | None = None
+        self._patch_arrays = _LRU(256)
         self._cats: dict[tuple, tuple[str, str | None]] = {}  # detail None = not computed
         self._file_stats: dict[tuple, tuple[int, float]] = {}  # size, fraction of bad sectors
         self._best: dict[tuple, tuple[int | None, str]] = {}
@@ -487,6 +493,27 @@ class RescueFS:
             chain.append(kids[part])
         return tuple(chain)
 
+    def path_of(self, tree: int, ino: int) -> str | None:
+        """Namespace path of an inode by its newest name (None if not under the root)."""
+        parts: list[str] = []
+        seen: set[int] = set()
+        while ino != ROOT_INO:
+            if ino in seen:
+                return None
+            seen.add(ino)
+            clause, args = self._gen_clause()
+            row = self.con.execute(
+                "SELECT dir, name FROM dirents WHERE tree=? AND child=? AND child_kind=1"
+                + clause
+                + " ORDER BY gen_max DESC LIMIT 1",
+                (tree, ino, *args),
+            ).fetchone()
+            if row is None:
+                return None
+            ino = row[0]
+            parts.append(fsname(row[1]))
+        return "/" + "/".join([self.tree_label(tree), *reversed(parts)])
+
     @staticmethod
     def chain_path(chain: tuple[Entry, ...]) -> str:
         return "/" + "/".join(e.name for e in chain)
@@ -617,7 +644,7 @@ class RescueFS:
         raw = (
             row.inline
             if row.etype == od.FILE_EXTENT_INLINE
-            else self.read_logical(row.disk_bytenr, row.disk_len)
+            else self._read_extent(row.disk_bytenr, row.disk_len, row.egen, 0, row.disk_len)
         )
         data = self._decompress(raw, row.comp, row.enc)[: row.ram_bytes] if row.comp else raw
         self._decoded.put(key, data)
@@ -640,8 +667,106 @@ class RescueFS:
         elif row.comp:
             data = self._decoded_extent(row)[row.eoff + rel : row.eoff + rel + length]
         else:
-            data = self.read_logical(row.disk_bytenr + row.eoff + rel, length)
+            data = self._read_extent(
+                row.disk_bytenr, row.disk_len, row.egen, row.eoff + rel, length
+            )
         return data + bytes(length - len(data)) if len(data) < length else data
+
+    def _read_extent(self, bytenr: int, disk_len: int, egen: int, start: int, length: int) -> bytes:
+        """`length` bytes at `start` within a data extent, with patched sectors replaced."""
+        patch = self._patch((bytenr, disk_len, egen))
+        try:
+            data = self.read_logical(bytenr + start, length)
+        except DataError:
+            if patch is None:
+                raise
+            data = bytes(length)  # location unknown, but copies of some sectors are known
+        if patch is None:
+            return data
+        phys, kind = patch
+        ss = self.sectorsize
+        first, last = start // ss, min(len(kind), -(-(start + length) // ss))
+        sel = np.flatnonzero(kind[first:last]) + first
+        if not len(sel):
+            return data
+        out = bytearray(data.ljust(length, b"\0"))
+        for s in sel:
+            s = int(s)
+            lo, hi = max(start, s * ss), min(start + length, (s + 1) * ss)
+            zero = kind[s] == PATCH_ZERO
+            sector = bytes(ss) if zero else self.dev.pread(ss, int(phys[s]))
+            out[lo - start : hi - start] = sector[lo - s * ss : hi - s * ss]
+        return bytes(out)
+
+    # ------------------------------------------------------------------ sector patches
+
+    def _patch(self, key: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray] | None:
+        """(physical offset per sector, patch kind per sector) of an extent, or None."""
+        if self._patch_rows is None:
+            self._patch_rows = {
+                (b, n, g): blob
+                for b, n, g, blob in self.con.execute(
+                    "SELECT disk_bytenr, disk_len, egen, patch FROM sector_patch"
+                )
+            }
+        blob = self._patch_rows.get(key)
+        if blob is None:
+            return None
+        hit = self._patch_arrays.get(key)
+        if hit is None:
+            raw = zlib.decompress(blob)
+            nsect = len(raw) // 9
+            hit = (
+                np.frombuffer(raw[: nsect * 8], dtype=np.int64),
+                np.frombuffer(raw[nsect * 8 :], dtype=np.uint8),
+            )
+            self._patch_arrays.put(key, hit)
+        return hit
+
+    def reset_patches(self) -> None:
+        """Reload patches (after `match`), and extent results they apply to."""
+        self._patch_rows = None
+        self._patch_arrays = _LRU(256)
+        self._ext_status = None
+        self._decoded = _LRU(64)
+
+    def _patched(self, key: tuple[int, int, int], c: ExtentCheck) -> ExtentCheck:
+        """`c` with patched bad sectors counted as good."""
+        patch = self._patch(key)
+        if patch is None:
+            return c
+        _phys, kind = patch
+        nsect = len(kind)
+        if c.sectors is not None:
+            states = np.frombuffer(zlib.decompress(c.sectors), dtype=np.uint8).copy()
+        elif not c.mapped:
+            states = np.full(nsect, SECTOR_BAD, dtype=np.uint8)
+        elif c.good + c.bad + c.nocsum != nsect:  # sampled (quick) result
+            return c
+        else:
+            st = SECTOR_OK if c.good else SECTOR_BAD if c.bad else SECTOR_NOCSUM
+            states = np.full(nsect, st, dtype=np.uint8)
+        fix = (states == SECTOR_BAD) & (kind != PATCH_NONE)
+        if not fix.any():
+            return c
+        states[fix] = SECTOR_OK
+        n = np.bincount(states, minlength=3)
+        good, bad, nocsum = int(n[SECTOR_OK]), int(n[SECTOR_BAD]), int(n[SECTOR_NOCSUM])
+        res = ExtentCheck(good, bad, nocsum, min(c.zero, bad), 1, None, int(fix.sum()))
+        if not res.uniform:
+            res = res._replace(sectors=zlib.compress(states.tobytes(), 1))
+        return res
+
+    def raw_extent_status(self, key: tuple[int, int, int]) -> ExtentCheck:
+        """The stored on-disk check of an extent, without patches."""
+        row = self.con.execute(
+            "SELECT good, bad, nocsum, zero, mapped, sectors FROM extent_status "
+            "WHERE disk_bytenr=? AND disk_len=? AND egen=?",
+            key,
+        ).fetchone()
+        return ExtentCheck(*row) if row else ExtentCheck(0, 0, 0, 0, 0)
+
+    # ------------------------------------------------------------------ reading files
 
     def read(
         self, tree: int, ino: int, offset: int, size: int, errors: list[str] | None = None
@@ -714,9 +839,10 @@ class RescueFS:
         return out
 
     def _load_extent_status(self) -> dict[tuple[int, int, int], ExtentCheck]:
+        """Stored extent checks, with sector patches applied."""
         if self._ext_status is None:
             self._ext_status = {
-                (b, n, g): ExtentCheck(*rest)
+                (b, n, g): self._patched((b, n, g), ExtentCheck(*rest))
                 for b, n, g, *rest in self.con.execute(
                     "SELECT disk_bytenr, disk_len, egen, good, bad, nocsum, zero, mapped, "
                     "sectors FROM extent_status"
@@ -733,15 +859,27 @@ class RescueFS:
         refresh: bool = False,
         comp: int = 0,
     ) -> ExtentCheck:
-        """Compare an extent's on-disk sectors with the recorded data checksums.
+        """Compare an extent's sectors with the recorded data checksums (patches applied).
 
-        Sectors without a checksum count as bad when they read as all zeros, or when the
-        extent is compressed (`comp`) and does not decompress - both mean nothing is there.
+        Results are cached; `refresh` re-reads the device. See `check_extent_raw`.
         """
         cache = self._load_extent_status()
         key = (disk_bytenr, disk_len, egen)
         if key in cache and not refresh:
             return cache[key]
+        res = self._patched(key, self.check_extent_raw(disk_bytenr, disk_len, egen, quick, comp))
+        if not quick:
+            cache[key] = res
+        return res
+
+    def check_extent_raw(
+        self, disk_bytenr: int, disk_len: int, egen: int, quick: bool = False, comp: int = 0
+    ) -> ExtentCheck:
+        """Compare an extent's on-disk sectors with the recorded data checksums.
+
+        Sectors without a checksum count as bad when they read as all zeros, or when the
+        extent is compressed (`comp`) and does not decompress - both mean nothing is there.
+        """
         ss = self.sectorsize
         nsect = max(1, -(-disk_len // ss))
         try:
@@ -792,8 +930,6 @@ class RescueFS:
             res = ExtentCheck(good, bad, nocsum, zero, 1)
             if not quick and not res.uniform:
                 res = res._replace(sectors=zlib.compress(bytes(states), 1))
-        if not quick:
-            cache[key] = res
         return res
 
     def verify_extent(self, row: ExtentRow) -> str:
@@ -806,12 +942,12 @@ class RescueFS:
         if not c.mapped:
             return "unmapped"
         if c.bad:
-            if c.good:
-                return "mixed"
-            return "zeroed" if c.zero == c.bad else "bad"
-        if c.nocsum:
-            return "partial" if c.good else "nocsum"
-        return "ok"
+            status = "mixed" if c.good else "zeroed" if c.zero == c.bad else "bad"
+        elif c.nocsum:
+            status = "partial" if c.good else "nocsum"
+        else:
+            status = "ok"
+        return f"{status}, {c.copied} sectors from copies" if c.copied else status
 
     def file_check(self, tree: int, ino: int) -> tuple[str, str]:
         """(category, detail) for a regular file in this view."""
@@ -820,7 +956,7 @@ class RescueFS:
         if hit is not None and hit[1] is not None:
             return hit
         lay = self.layout(tree, ino)
-        good = bad = nocsum = unmapped = 0
+        good = bad = nocsum = unmapped = copied = 0
         ss = self.sectorsize
         seen: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
         comps: dict[tuple[int, int, int], int] = {}
@@ -842,7 +978,7 @@ class RescueFS:
                 unmapped += 1
                 continue
             g, bd, nc = c.counts(ranges, max(1, -(-k[1] // ss)))
-            good, bad, nocsum = good + g, bad + bd, nocsum + nc
+            good, bad, nocsum, copied = good + g, bad + bd, nocsum + nc, copied + c.copied
         if not lay.segments and lay.size > 0:
             res = (CAT_LOST, "no data extents recovered")
         elif not seen:
@@ -855,6 +991,8 @@ class RescueFS:
             detail = f"sectors ok {good}, bad {bad}, unverifiable {nocsum}"
             if unmapped:
                 detail += f", {unmapped} unmapped extents"
+            if copied:
+                detail += f" ({copied} recovered from copies)"
             if bad == 0 and unmapped == 0:
                 res = (CAT_UNVERIFIED if nocsum else CAT_INTACT, detail)
                 if nocsum and self._implausible(tree, ino):
@@ -871,6 +1009,92 @@ class RescueFS:
         self._cats[key] = res
         self._file_stats[key] = (lay.size, frac)
         return res
+
+    def problem_ranges(self, tree: int, ino: int) -> list[tuple[int, int, str]]:
+        """[(start, end, "bad" | "unverified")] byte ranges of a file in this view, merged.
+
+        A compressed extent with any bad sector is bad as a whole (it cannot be decoded).
+        """
+        ss = self.sectorsize
+        out: list[tuple[int, int, str]] = []
+
+        def add(lo: int, hi: int, kind: str) -> None:
+            if hi <= lo:
+                return
+            if out and out[-1][2] == kind and out[-1][1] >= lo:
+                out[-1] = (out[-1][0], max(out[-1][1], hi), kind)
+            else:
+                out.append((lo, hi, kind))
+
+        for a, b, row in self.layout(tree, ino).segments:
+            if not row.is_data:
+                continue
+            c = self.check_extent(row.disk_bytenr, row.disk_len, row.egen, comp=row.comp)
+            if not c.mapped:
+                add(a, b, "bad")
+                continue
+            if row.comp or c.uniform or c.sectors is None:
+                if c.bad:
+                    add(a, b, "bad")
+                elif c.nocsum:
+                    add(a, b, "unverified")
+                continue
+            states = np.frombuffer(zlib.decompress(c.sectors), dtype=np.uint8)
+            first = (row.eoff + a - row.foff) // ss
+            last = -(-(row.eoff + b - row.foff) // ss)
+            for s in range(first, min(last, len(states))):
+                st = states[s]
+                if st == SECTOR_OK:
+                    continue
+                lo = max(a, row.foff - row.eoff + s * ss)
+                hi = min(b, row.foff - row.eoff + (s + 1) * ss)
+                add(lo, hi, "bad" if st == SECTOR_BAD else "unverified")
+        return out
+
+    def compare_content(self, tree: int, ino: int, content: bytes) -> tuple[int, int]:
+        """(matching, compared) sectors of `content` against this file's expected checksums.
+
+        Only uncompressed data extents with recorded checksums can be compared (compressed
+        extents are checksummed after compression). The last sector of a file is compared
+        with its zero padding, as btrfs writes it.
+        """
+        ss = self.sectorsize
+        lay = self.layout(tree, ino)
+        match = compared = 0
+        for a, b, row in lay.segments:
+            if not row.is_data or row.comp:
+                continue
+            nsect = max(1, -(-row.disk_len // ss))
+            sums = self._data_csums(row.disk_bytenr, nsect, row.egen)
+            base = row.foff - row.eoff  # file offset of the extent's first sector
+            for s in range(max(0, (a - base) // ss), min(nsect, -(-(b - base) // ss))):
+                lo = base + s * ss
+                if sums[s] is None or lo < a:
+                    continue
+                if lo + ss <= b:
+                    data = content[lo : lo + ss]
+                elif b == lay.size:  # file tail, zero padded on disk
+                    data = content[lo:b]
+                else:
+                    continue
+                if len(data) < ss:
+                    data = data + bytes(ss - len(data))
+                compared += 1
+                match += self._csum(data) == sums[s]
+        return match, compared
+
+    def _has_data(self, tree: int, ino: int, lo: int, hi: int) -> bool:
+        """True if [lo, hi) is fully covered by data (not holes/prealloc) in this view."""
+        at = lo
+        for a, b, row in self.layout(tree, ino).segments:
+            if b <= at or a >= hi:
+                continue
+            if a > at or not (row.is_data or row.etype == od.FILE_EXTENT_INLINE):
+                return False
+            at = b
+            if at >= hi:
+                return True
+        return at >= hi
 
     def _name_of(self, tree: int, ino: int) -> str:
         row = self.con.execute(
@@ -900,6 +1124,8 @@ class RescueFS:
             if row.etype == od.FILE_EXTENT_INLINE:
                 return True
             if row.is_data:
+                if self._patch((row.disk_bytenr, row.disk_len, row.egen)) is not None:
+                    return True
                 try:
                     if self.map_logical(row.disk_bytenr):
                         return True
@@ -990,7 +1216,7 @@ class RescueFS:
         return self._masks_valid
 
     def _classify_key(self) -> str:
-        return classify_key(self.exclude)
+        return classify_key(self.exclude, get_meta(self.con, "patch_serial", ""))
 
     def classified(self) -> bool:
         return get_meta(self.con, "classify_exclude") is not None
@@ -1093,9 +1319,10 @@ class RescueFS:
         return out
 
 
-def classify_key(exclude) -> str:
-    """Identifies stored categories: valid only for these rules and this exclude list."""
-    return json.dumps({"v": MASK_VERSION, "exclude": sorted(exclude)})
+def classify_key(exclude, patch_serial: str = "") -> str:
+    """Identifies stored categories: valid only for these rules, this exclude list and these
+    sector patches."""
+    return json.dumps({"v": MASK_VERSION, "exclude": sorted(exclude), "patches": patch_serial})
 
 
 def paint(rows: Iterator[ExtentRow] | list[ExtentRow]) -> list[tuple[int, int, ExtentRow]]:

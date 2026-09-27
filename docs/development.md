@@ -7,15 +7,21 @@ uv run ruff check . && uv run ruff format --check .
 ```
 
 Test images are created under `<tmp_dir>/pytest` (from the config), not `/tmp`. The suite
-(~15 s) needs `mkfs.btrfs`; the real-mount test also needs `/dev/fuse` and `fusermount3` and is
-skipped otherwise.
+(~30 s) needs `mkfs.btrfs` (btrfs-progs with `--rootdir` subvolume support, 6.12+); the
+real-mount test also needs `/dev/fuse` and `fusermount3` and is skipped otherwise, the git test
+needs `git`.
+
+CI (`.github/workflows/ci.yml`) runs lint and the suite in a Fedora container on every push to
+`main`/`v*` branches and on pull requests.
 
 | file | covers |
 |---|---|
 | `test_units.py` | extent painting vs a byte-by-byte reference, checksum-leaf index vs SQL, per-sector counting, file-type sniffing, index migration |
 | `test_scan.py` | chunk size, split and interrupted/resumed scans find identical blocks |
 | `test_roundtrip.py` | scan → extract → read for no/zlib/lzo/zstd compression and 4 KiB nodes, CLI commands, excludes, corrupted files, compatibility warnings |
-| `test_consistency.py` | one image with every case (intact, damaged, lost, no data, newer version broken, truncated to empty, reflink/prealloc ordering, bad sector outside the referenced range, unchecksummed zeros/garbage): every file in exactly one category folder, folder counts = README totals, `all/` = everything minus lost, `best/` content, sizes = content everywhere, no empty directories, `restore` = `best/`, shell smoke test |
+| `test_consistency.py` | one image with every case (intact, damaged, lost, no data, newer version broken, truncated to empty, reflink/prealloc ordering, bad sector outside the referenced range, unchecksummed zeros/garbage): every file in exactly one category folder, folder counts = README totals, `all/` = everything minus lost, `best/` content, sizes = content everywhere, no empty directories, `restore` = `best/`, `review` rows and ranges, `restore --fill-older`, shell smoke test |
+| `test_match.py` | bad sectors recovered from a plain copy and as zeros, a lone sector and a file without copies stay lost, `classify` matches by default and `restore` writes the patched content, chance matches (planted in the hash array) are ignored or rejected on re-read |
+| `test_gitrescue.py` | lost work-tree files come back from the index (verified, incl. staged changes newer than HEAD) and HEAD (older version, "size differs"); hooks are not run |
 | `test_fuse_layout.py` | mount folders through the FUSE operations: history, live refresh, flat mode, hidden unreadable files |
 | `test_fuse_mount.py` | a real kernel mount: listing, reading, symlinks, read-only |
 
@@ -58,10 +64,14 @@ src/mbkn_btrfs_rescue/
   scan.py      pass 1: device sweep (read-ahead thread)
   extract.py   pass 2: leaves -> item tables
   classify.py  pass 3: per-sector checks, categories, best versions, directory masks
+  sectorhash.py  per-sector checksums of the whole device (cached .npy, worker processes)
+  match.py     pass 4: bad sectors from confirmed identical copies -> sector_patch
   pipeline.py  analyze: resumable scan -> extract -> classify, status for the live mount
   model.py     RescueFS: namespace, layouts (painting), content, verification, best version
   sniff.py     does unchecksummed content fit its file type?
-  restore.py   copy-out with report
+  restore.py   copy-out with report, --fill-older
+  review.py    review list (TSV) of unverified/damaged files with byte ranges
+  gitrescue.py lost work-tree files from .git objects via the git CLI
   shell.py     interactive browser
   fusefs.py    FUSE operations (mfusepy)
   cli.py       argparse entry point

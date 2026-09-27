@@ -96,11 +96,22 @@ def readme_text(fs: RescueFS | None, con: sqlite3.Connection) -> str:
         "Its files show the timestamps of the version served. Then check intact/, unverified/;",
         "damaged/ files contain garbage in the bad parts.",
         "lost/ lists what existed, but its content could not be recovered.",
+        *_copies_line(con),
         "all/ and history/ leave out files without recoverable data (zeros or lost).",
         f"Hidden names: {', '.join(sorted(fs.exclude)) or '(none)'}",
         "",
     ]
     return "\n".join(lines)
+
+
+def _copies_line(con: sqlite3.Connection) -> list[str]:
+    row = con.execute("SELECT count(*), sum(copied), sum(zeros) FROM sector_patch").fetchone()
+    if not row or not row[0]:
+        return []
+    return [
+        f"Bad sectors replaced everywhere: {row[1] or 0} from identical copies found on the "
+        f"disk, {row[2] or 0} known to be zeros.",
+    ]
 
 
 class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]

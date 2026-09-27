@@ -90,13 +90,20 @@ CREATE TABLE IF NOT EXISTS file_cat (
 CREATE TABLE IF NOT EXISTS best_version (
     tree INTEGER, ino INTEGER, gen INTEGER, cat TEXT, PRIMARY KEY (tree, ino)
 );
+-- Filled by `match`: per extent, where to read bad sectors from instead (identical copies).
+-- patch = zlib(int64 physical offset per sector (-1 none) + uint8 kind per sector).
+CREATE TABLE IF NOT EXISTS sector_patch (
+    disk_bytenr INTEGER, disk_len INTEGER, egen INTEGER,
+    copied INTEGER, zeros INTEGER, patch BLOB,
+    PRIMARY KEY (disk_bytenr, disk_len, egen)
+);
 CREATE TABLE IF NOT EXISTS node_mask (
     tree INTEGER, ino INTEGER, mask INTEGER, PRIMARY KEY (tree, ino)  -- ino -1 = .orphans
 );
 """
 
 ITEM_TABLES = ("chunks", "roots", "root_refs", "inodes", "dirents", "extents")
-CLASSIFY_TABLES = ("extent_status", "file_cat", "node_mask", "best_version")
+CLASSIFY_TABLES = ("extent_status", "file_cat", "node_mask", "best_version", "sector_patch")
 
 U64 = 1 << 64
 
@@ -126,6 +133,12 @@ def _migrate(con: sqlite3.Connection) -> None:
     cols = {r[1] for r in con.execute("PRAGMA table_info(extent_status)")}
     if "sectors" not in cols:  # 0.1: per-extent counts only; mixed extents get re-checked
         con.execute("ALTER TABLE extent_status ADD COLUMN sectors BLOB")
+        con.commit()
+    if "weak" in {r[1] for r in con.execute("PRAGMA table_info(sector_patch)")}:
+        # 0.3 development builds kept unconfirmed matches: drop them, `match` runs again
+        con.execute("DROP TABLE sector_patch")
+        con.execute("DELETE FROM meta WHERE key = 'patch_serial'")
+        con.executescript(SCHEMA)
         con.commit()
 
 

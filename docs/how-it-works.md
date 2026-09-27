@@ -30,11 +30,16 @@ filesystem bottom-up from the leaves.
    │          (each item merged across all generations it was seen in: gen_min..gen_max)
    │
    │  classify verify every data sector against the csum tree (physical order)
-   ▼          -> per-sector states, per-file category, best version, per-directory mask
- RescueFS     namespace / path resolution / file layout / categories
-   ├── shell    interactive browser
-   ├── mount    read-only FUSE
-   └── restore  copy out + TSV report
+   │          -> per-sector states
+   │  match    hash every device sector once; bad sectors whose expected checksum is found
+   │          next to their neighbour's -> sector patches (copies, zeros)
+   ▼          -> per-file category, best version, per-directory mask
+ RescueFS     namespace / path resolution / file layout (+ patches) / categories
+   ├── shell       interactive browser
+   ├── mount       read-only FUSE
+   ├── restore     copy out + TSV report (--fill-older)
+   ├── review      unverified/damaged files with bad byte ranges
+   └── git-rescue  lost work-tree files from .git (index, stash, HEAD)
 ```
 
 ### scan
@@ -136,6 +141,40 @@ versions, or real content instead of an empty file. The mount's `best/` folder a
 (default) serve that version; `stat` in the shell names it. Files with nothing readable in any
 version are the only ones missing from `best/`.
 
+### copies
+
+A bad sector's expected checksum is still in the checksum tree, and the same data is often
+somewhere else on the device: a plain `cp` of the file, another subvolume, the second copy of
+DUP data, the old location of a chunk moved by a balance. `match` hashes every sector of the
+device once (numpy array, one key per sector, built by worker processes at disk speed) and
+looks the expected checksums up in it.
+
+With crc32c (32 bits) chance matches are common: on a 500 GB disk (125M sectors) a given
+checksum matches some unrelated sector with a probability of about 3% - on the real disk
+1.9M of 67M bad sectors had such a match. A candidate therefore counts only when it is
+**confirmed**: the bad sector's logical neighbour (previous or next sector, bad or good, in the
+same or an adjacent extent) matches the device sector right next to the candidate. A chance
+match passes that with a probability of about 2^-32. All-zero sectors never confirm (zeros are
+everywhere). A lone sector (a file of one sector) cannot be confirmed and is not recovered this
+way. With 64-bit or longer checksums (xxhash64, sha256, blake2b) every match counts. Each
+chosen sector is re-read and verified against the full checksum before it is recorded.
+
+A bad sector whose expected checksum is that of an all-zero sector held zeros (sparse
+regions of images and databases); it is restored as zeros without reading anything.
+
+Results are stored per extent (`sector_patch`: for each sector, where to read it instead) and
+applied when reading and categorising: a patched sector counts as verified. `stat` shows
+`N sectors from copies` per extent, the file detail `(N recovered from copies)`.
+
+### git repositories
+
+Source code whose data blocks were discarded is often still inside `.git`, compressed in
+object files and packs (so `match` cannot see it). `git-rescue` restores the readable part of
+each affected repository's `.git` to a scratch directory and asks `git` for the blobs of every
+lost or damaged path in the index (staged), the latest stash and HEAD; each blob is re-hashed
+to its object id. A blob is then compared with the lost file's expected sector checksums
+(uncompressed extents): if all comparable sectors match, it *is* the lost content.
+
 ### verification (per extent)
 
 For each data extent the tool looks up the checksum tree leaves written at or after the
@@ -150,6 +189,8 @@ extent's generation and compares per-sector checksums:
 | `bad`      | mismatch: the space was reused, the data is probably overwritten |
 | `zeroed`   | mismatch and the extent reads as all zeros — typically discarded by TRIM |
 | `unmapped` | the logical address is not covered by any recovered chunk |
+
+`, N sectors from copies` is appended when `match` replaced bad sectors of the extent.
 
 **Encrypted devices (LUKS / dm-crypt):** a TRIMmed block reads as zeros *below* the encryption
 layer, which decrypts to random-looking bytes. On a LUKS device, discarded data therefore
@@ -173,6 +214,8 @@ records, 370k files:
 | extract | ~30 s (also runs incrementally during the scan) |
 | classify: checking data | disk speed (~570 MiB/s, physical order); later runs re-check only new or changed-rule extents |
 | classify: categorising + best versions | ~25 s |
+| match: hashing the device (once, cached) | ~1.3 GiB/s (6.5 min for 477 GiB) |
+| match: 67M bad sectors in 714k extents | ~5 min |
 | mount: first listing | ~1 s (loads stored categories), then ~0.1 ms per entry |
 
 Directory listings, the subvolume list and file layouts are cached per index snapshot; the
@@ -188,4 +231,9 @@ kernel caches attributes and pages of the read-only mount.
   unknown or naturally random type (compressed media without a known signature) stays
   `unverified`. Check such files before trusting them.
 * `best/` picks whole versions; it does not combine good parts of different versions into one
-  file (that would produce content that never existed).
+  file (that would produce content that never existed). `restore --fill-older` does, on
+  request, and lists every filled range. Identical content from other versions is already
+  used automatically (`match` finds it by checksum).
+* With crc32c, copies of single-sector data cannot be confirmed and are not used.
+* `git-rescue` needs the repository's objects to be readable; blobs in damaged packs are
+  skipped (every blob is re-hashed).
