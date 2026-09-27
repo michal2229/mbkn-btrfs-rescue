@@ -22,7 +22,21 @@ def pytest_configure(config):
         cfg = load_config()
         base = cfg.tmp_dir / "pytest"
         base.mkdir(parents=True, exist_ok=True)
+        _prune(base, keep=KEEP_RUNS)
         config.option.basetemp = str(base / f"run-{os.getpid()}")
+
+
+KEEP_RUNS = 2  # earlier runs' images are removed (each run leaves ~0.5 GB)
+
+
+def _prune(base: Path, keep: int) -> None:
+    """Delete all but the newest `keep` runs (never one with a mount inside)."""
+    runs = sorted(base.glob("run-*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    with open("/proc/self/mounts") as fh:
+        mounts = [line.split()[1] for line in fh]
+    for old in runs[keep:]:
+        if not any(m.startswith(str(old.resolve()) + "/") for m in mounts):
+            shutil.rmtree(old, ignore_errors=True)
 
 
 def make_tree(root: Path) -> dict[str, bytes]:
@@ -50,7 +64,11 @@ def make_tree(root: Path) -> dict[str, bytes]:
 
 
 def build_image(
-    tmp: Path, compress: str = "no", nodesize: int = 16384, maker=make_tree
+    tmp: Path,
+    compress: str = "no",
+    nodesize: int = 16384,
+    maker=make_tree,
+    extra: tuple[str, ...] = (),
 ) -> tuple[Path, dict]:
     if MKFS is None:
         pytest.skip("mkfs.btrfs not available")
@@ -72,6 +90,7 @@ def build_image(
             "rw:_work",
             "--compress",
             compress,
+            *extra,
             str(img),
         ],
         check=True,

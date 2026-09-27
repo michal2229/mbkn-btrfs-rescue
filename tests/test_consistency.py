@@ -144,7 +144,7 @@ def test_folder_counts_match_readme_totals(scenario):
         files, _ = _walk(ops, f"/{cat}")
         assert len(files) == totals[cat][0], cat
     readme = ops.read("/README.txt", 100000, 0, 0).decode()
-    assert "2 files use an older version" in readme
+    assert "2 older versions used" in readme
 
 
 def test_expected_categories(scenario):
@@ -175,6 +175,8 @@ def test_review_lists_damaged_files_with_their_bad_ranges(scenario, capsys):
     assert "1 damaged" in out.err
     assert main([*base, "review", f"/{work}/proj/pkg", "--include", "lost"]) == 0
     assert f"/{work}/proj/pkg/rand.bin" in capsys.readouterr().out
+    with pytest.raises(SystemExit, match="unknown categories: bogus"):
+        main([*base, "review", "--include", "damaged,bogus"])
 
 
 def test_all_hides_exactly_the_lost_files(scenario):
@@ -283,6 +285,31 @@ def test_shell_commands_smoke(scenario, capsys):
     assert "older version at generation" in out  # stat shows the best/ fallback
     assert "Traceback" not in out
     assert (tmp / "sh-out/main.py").read_bytes() == files["_work/proj/main.py"]
+
+
+def test_shell_gen_and_exclude_refresh_listings(scenario, capsys):
+    """Changing the generation or the hidden names must not show cached listings."""
+    from mbkn_btrfs_rescue.shell import Shell
+
+    _tmp, img, db, _files, _base, work = scenario
+    sh = Shell(RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE))
+
+    def ls(path: str) -> set[str]:
+        capsys.readouterr()
+        sh.onecmd(f"ls -a {path}")
+        words = capsys.readouterr().out.split()
+        return {w.strip("/✓?!✗~ ") for w in words}
+
+    assert "proj" in ls(f"/{work}")
+    sh.onecmd("exclude proj")
+    assert "proj" not in ls(f"/{work}")
+    sh.onecmd("exclude -proj")
+    assert "proj" in ls(f"/{work}")
+    sh.onecmd("gen 1")  # before anything was written: no project yet
+    assert "proj" not in ls(f"/{work}")
+    sh.onecmd("gen off")
+    assert "proj" in ls(f"/{work}")
+    assert ".venv" not in ls(f"/{work}")
 
 
 def test_extract_twice_is_idempotent(indexed):
@@ -445,8 +472,10 @@ def test_unchecksummed_compressed_garbage_is_lost(tmp_path):
     assert fs.file_check(tree, main_py)[0] == "intact"  # inline
 
 
-def test_restore_fill_older_fills_bad_ranges_from_an_older_version(indexed):
-    """Newest version: first sector bad. Older version: good there, bad in the middle."""
+def test_damaged_file_is_filled_from_an_older_version_everywhere(indexed):
+    """Newest version: first sector bad. Older version: good there, bad in the middle.
+
+    best/, patched/ and restore serve the newest version with the bad sector filled."""
     tmp, img, db, files, base = indexed
     con = connect(db)
     fs = RescueFS(con, Device(str(img)))
@@ -477,10 +506,21 @@ def test_restore_fill_older_fills_bad_ranges_from_an_older_version(indexed):
     assert main([*base, "classify", "--no-match"]) == 0
     fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
     assert fs.best_version(tree, ino) == (None, "damaged")  # newest: 1 bad sector, older: 3
-    out = tmp / "filled"
-    assert main([*base, "restore", "--fill-older", f"/{work}/proj/pkg/big.txt", str(out)]) == 1
     want = bytearray(files["_work/proj/pkg/big.txt"])
     want[10 * 4096 : 13 * 4096] = bytes(3 * 4096)  # the newer version's hole
+    out = tmp / "filled"
+    assert main([*base, "restore", f"/{work}/proj/pkg/big.txt", str(out)]) == 0
     assert (out / "big.txt").read_bytes() == bytes(want)
     report = next(out.glob(".mbkn-restore-*.tsv")).read_text()
-    assert "filled from older versions: 0-4096@" in report
+    assert "reconstructed" in report and "[0-4096@" in report
+    ops = _ops(img, db)
+    for folder in ("best", "patched"):
+        p = f"/{folder}/{work}/proj/pkg/big.txt"
+        assert ops.read(p, len(want) + 1, 0, 0) == bytes(want), folder
+    patched, _ = _walk(ops, "/patched")
+    assert list(patched) == [f"/{work}/proj/pkg/big.txt"]
+    tsv = ops.read("/PATCHED.tsv", 1 << 20, 0, 0).decode().splitlines()
+    assert tsv[1].startswith(f"/{work}/proj/pkg/big.txt\tolder\tyes\t")
+    raw = tmp / "raw"
+    assert main([*base, "restore", "--no-patch", f"/{work}/proj/pkg/big.txt", str(raw)]) == 0
+    assert not (raw / "big.txt").exists()  # damaged: not written without --include damaged

@@ -86,3 +86,46 @@ def test_lost_files_come_back_from_git(tmp_path):
     assert (got / "a.py").read_bytes() == files["_work/repo/a.py"]
     assert (got / "c.py").read_bytes() == files["_work/repo/c.py"]
     assert (got / "b.py").read_bytes() == _src(400, 2)
+
+
+def test_best_serves_git_content_by_default(tmp_path):
+    """classify stores git reconstructions; best/ and patched/ serve them, restore writes them."""
+    fusefs = pytest.importorskip("mbkn_btrfs_rescue.fusefs")
+    pytest.importorskip("mfusepy")
+    img, files = build_image(tmp_path, maker=_tree)
+    db = tmp_path / "index.sqlite"
+    base = ["-d", str(img), "--db", str(db)]
+    assert main([*base, "scan"]) == 0 and main([*base, "extract"]) == 0
+    fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
+    work = next(n for n in fs.children(ROOT) if n.startswith("_work@"))
+    spans = []
+    for name in ("a.py", "b.py", "c.py", "d.py"):
+        e = fs.resolve(f"/{work}/repo/{name}")[-1]
+        for _a, _b, r in fs.layout(e.node.tree, e.node.ino).segments:
+            spans.append((fs.map_logical(r.disk_bytenr)[0], r.disk_len))
+    with img.open("r+b") as fh:  # test image only
+        for phys, length in spans:
+            fh.seek(phys)
+            fh.write(random.Random(8).randbytes(length))
+    assert main([*base, "classify", "--no-match"]) == 0
+
+    ops = fusefs.RescueOps(RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE))
+    want = {
+        "a.py": files["_work/repo/a.py"],
+        "b.py": _src(400, 2),  # committed, older
+        "c.py": files["_work/repo/c.py"],  # staged
+    }
+    for folder in ("best", "patched"):
+        names = set(ops.readdir(f"/{folder}/{work}/repo", None)[2:])
+        assert {"a.py", "b.py", "c.py"} <= names and "d.py" not in names, folder
+        for name, data in want.items():
+            p = f"/{folder}/{work}/repo/{name}"
+            assert ops.getattr(p)["st_size"] == len(data)
+            assert ops.read(p, len(data) + 1, 0, 0) == data
+    tsv = ops.read("/PATCHED.tsv", 1 << 20, 0, 0).decode()
+    assert "git:index\tyes\tgit index: verified" in tsv
+    out = tmp_path / "out"
+    assert main([*base, "restore", f"/{work}/repo", str(out)]) == 0
+    for name, data in want.items():
+        assert (out / "repo" / name).read_bytes() == data
+    assert not (out / "repo" / "d.py").exists()

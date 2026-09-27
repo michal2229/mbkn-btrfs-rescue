@@ -72,4 +72,10 @@ print(f"   config    {cfg.source}\n   device    {cfg.device or '(not set)'}")
 print(f"   tmp_dir   {cfg.tmp_dir}\n   cache_dir {cfg.cache_dir}\n   index     {cfg.db_path}")
 PY
 
+# 6. git hooks: static checks on commit, tests on push
+if git -C "$(dirname "$0")/.." rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$(dirname "$0")/.." config core.hooksPath scripts/git-hooks
+    info "git hooks enabled (scripts/git-hooks: checks on commit, tests on push)"
+fi
+
 info "done. Next: scripts/device-access.sh grant <device>, then: uv run mbkn-btrfs-rescue info"

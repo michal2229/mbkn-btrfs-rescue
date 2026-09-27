@@ -33,11 +33,13 @@ filesystem bottom-up from the leaves.
    │          -> per-sector states
    │  match    hash every device sector once; bad sectors whose expected checksum is found
    │          next to their neighbour's -> sector patches (copies, zeros)
+   │  current  walk the newest tree of every subvolume -> names that exist now
+   │  patch    reconstructions for damaged/lost files: older versions, git
    ▼          -> per-file category, best version, per-directory mask
  RescueFS     namespace / path resolution / file layout (+ patches) / categories
    ├── shell       interactive browser
    ├── mount       read-only FUSE
-   ├── restore     copy out + TSV report (--fill-older)
+   ├── restore     copy out + TSV report (reconstructions as in best/)
    ├── review      unverified/damaged files with bad byte ranges
    └── git-rescue  lost work-tree files from .git (index, stash, HEAD)
 ```
@@ -111,7 +113,7 @@ whole. Per-sector results are stored for extents that mix good and bad sectors.
 
 | category | rule |
 |---|---|
-| `intact` | every referenced sector matches its checksum, or the data is inline / empty |
+| `intact` | every referenced sector matches its checksum (read in place or from a confirmed copy, see [copies](#copies)), or the data is inline / empty |
 | `unverified` | no mismatches, some sectors have no checksum on record - and the data is plausible (below) |
 | `damaged` | some sectors are good, some bad |
 | `lost` | nothing good: all sectors bad, no data extents recovered, or only holes |
@@ -130,7 +132,8 @@ On the LUKS disk this was built for, 1,900 of 2,500 "no checksum" files turned o
 garbage by these tests (random bytes where `.wav`, `.js`, `.md` data should be).
 
 `classify` stores the category per file and a bitmask per directory ("which categories exist
-below here"), so the FUSE category folders and the shell listing are instant.
+below here", plus whether `best/` and `patched/` have something there), so the FUSE folders
+and the shell listing are instant.
 
 ### best version
 
@@ -175,6 +178,26 @@ lost or damaged path in the index (staged), the latest stash and HEAD; each blob
 to its object id. A blob is then compared with the lost file's expected sector checksums
 (uncompressed extents): if all comparable sectors match, it *is* the lost content.
 
+### reconstructions (best/, patched/)
+
+After categorising, every file whose best version is still damaged or lost gets the most
+complete content available, in this order: a git blob identical to the lost file (all
+comparable sectors match its checksums); the best version with *all* bad ranges filled from
+older versions (newest first, only where the older version has verified data - holes and
+preallocated space are not data); a git blob of the same size; a git blob of another size;
+the best version partly filled. The choice is stored (`file_patch`, git content in `git_blob`),
+so reading needs neither git nor the older versions' lookups. Filled content can be older
+than the rest of the file; `PATCHED.tsv` lists every reconstruction and its source.
+
+### current state
+
+The index merges all generations, so it cannot say by itself which names still exist. For
+`current/`, the newest root item of each subvolume that is still referenced in the newest root
+tree is followed down its b-tree: internal nodes carry each child's logical address *and*
+generation, and the scan index maps that pair to the block on disk, which is re-read and
+verified. The `DIR_INDEX` items in those leaves are exactly the current names. Blocks that no
+longer verify are counted (`current_missing`); their names are missing from `current/`.
+
 ### verification (per extent)
 
 For each data extent the tool looks up the checksum tree leaves written at or after the
@@ -205,18 +228,25 @@ leaves and survive, as do all names, sizes and timestamps.
 
 ## Performance
 
-Measured on a 477 GiB NVMe behind LUKS (1.6 GB/s raw reads), 250k tree blocks, 1.6M extent
-records, 370k files:
+Measured on a 477 GiB NVMe behind LUKS (1.6 GB/s raw reads), 250k tree blocks, 1.3M extent
+records, 370k files, 67M bad sectors, 30 git repositories:
 
 | step | time |
 |---|---|
-| scan | ~1.2 GiB/s (read-ahead thread, reused buffers) |
-| extract | ~30 s (also runs incrementally during the scan) |
-| classify: checking data | disk speed (~570 MiB/s, physical order); later runs re-check only new or changed-rule extents |
-| classify: categorising + best versions | ~25 s |
-| match: hashing the device (once, cached) | ~1.3 GiB/s (6.5 min for 477 GiB) |
-| match: 67M bad sectors in 714k extents | ~5 min |
+| scan (+ extract during it) | ~7 min (~1.2 GiB/s, read-ahead thread, reused buffers) |
+| classify: checking data | ~12.5 min for 398 GiB of extents (~550 MiB/s, physical order); later runs re-check only new or changed-rule extents |
+| match: hashing the device (once, cached) | ~7 min (~1.2 GiB/s, worker processes) |
+| match: looking up 67M bad sectors | ~3 min |
+| current state, categorising, reconstructions (git) | ~2 min (categorising twice ~30 s each, git ~12 s) |
+| **whole analysis from scratch** | **~30 min** |
 | mount: first listing | ~1 s (loads stored categories), then ~0.1 ms per entry |
+
+Every step that reads the device in bulk (scan, checking, hashing) tells the kernel to drop
+the pages behind it, read-ahead included, so a 500 GB pass does not push everything else out
+of RAM - with a full page cache, hashing had run at a third of its speed.
+
+A fresh analysis of the same device reproduces the index exactly (same blocks, items,
+per-sector results, categories, copies and reconstructions).
 
 Directory listings, the subvolume list and file layouts are cached per index snapshot; the
 kernel caches attributes and pages of the read-only mount.
@@ -230,10 +260,8 @@ kernel caches attributes and pages of the read-only mount.
 * The plausibility tests for unchecksummed data are heuristics: random-looking content of an
   unknown or naturally random type (compressed media without a known signature) stays
   `unverified`. Check such files before trusting them.
-* `best/` picks whole versions; it does not combine good parts of different versions into one
-  file (that would produce content that never existed). `restore --fill-older` does, on
-  request, and lists every filled range. Identical content from other versions is already
-  used automatically (`match` finds it by checksum).
+* Reconstructions that fill bad ranges from older versions combine content of different
+  times; they are listed in `patched/` and `PATCHED.tsv`, never mixed silently.
 * With crc32c, copies of single-sector data cannot be confirmed and are not used.
 * `git-rescue` needs the repository's objects to be readable; blobs in damaged packs are
   skipped (every blob is re-hashed).

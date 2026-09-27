@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,7 +54,7 @@ WANTED = frozenset({CAT_LOST, CAT_DAMAGED})
 class Candidate:
     source: str
     sha: str
-    data: bytes | None = None
+    data: bytes = b""
     matched: int = 0
     compared: int = 0
 
@@ -108,6 +109,7 @@ def _git(git_dir: Path, *args: str, stdin: bytes | None = None) -> subprocess.Co
         "GIT_OPTIONAL_LOCKS": "0",
         "LC_ALL": "C",
     }
+    assert GIT is not None
     return subprocess.run(
         [GIT, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", *args],
         input=stdin,
@@ -188,6 +190,92 @@ def _blobs(git_dir: Path, shas: list[str]) -> dict[str, bytes]:
     return out
 
 
+@dataclass
+class GitMatch:
+    """What a repository holds for one lost/damaged work-tree file."""
+
+    repo: str  # work tree path
+    path: str  # namespace path
+    entry: Entry
+    category: str  # best category of the file itself
+    lost_size: int
+    best: Candidate | None  # readable blob, most likely to be the lost content
+    check: str  # verified | same size | size differs | object lost: ... | not tracked
+
+
+def git_matches(
+    fs: RescueFS,
+    under: str = "/",
+    *,
+    categories: frozenset[str] = WANTED,
+    scratch: Path | None = None,
+    progress: bool = True,
+) -> Iterator[GitMatch]:
+    """For every lost/damaged file in git work trees below `under`, its best blob."""
+    if GIT is None:
+        return
+    repos = find_repos(fs, under)
+    bits = CAT_BITS[CAT_DAMAGED] | CAT_BITS[CAT_LOST]
+    for n, (wt_path, root, git_entry) in enumerate(repos, 1):
+        if fs.masks_valid() and not fs.entry_mask(root) & bits:
+            continue  # nothing damaged or lost in this work tree
+        files = _worktree_files(fs, root, categories)
+        if not files:
+            continue
+        if progress:
+            print(
+                f"\r  git: repository {n}/{len(repos)} ({len(files)} files) ",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+        with tempfile.TemporaryDirectory(dir=scratch, prefix="git-rescue-") as tmp:
+            restore(
+                fs,
+                git_entry,
+                Path(tmp),
+                categories=frozenset({CAT_INTACT, CAT_UNVERIFIED}),
+                patch=False,
+                progress=False,
+            )
+            git_dir = Path(tmp) / ".git"
+            _neutralise(git_dir)
+            listing = _listing(git_dir)
+            wanted = {rel: listing.get(rel, []) for rel in files}
+            blobs = _blobs(git_dir, sorted({s for c in wanted.values() for _src, s in c}))
+        for rel, (e, cat) in files.items():
+            yield _match(fs, wt_path, rel, e, cat, wanted[rel], blobs)
+    if progress and repos:
+        print(file=sys.stderr)
+
+
+def _match(fs: RescueFS, repo: str, rel: str, e: Entry, cat: str, cands, blobs) -> GitMatch:
+    t, i = e.node.tree, e.node.ino
+    lost_size = fs.layout(t, i).size
+    best: Candidate | None = None
+    for source, sha in cands:
+        data = blobs.get(sha)
+        if data is None:
+            continue
+        c = Candidate(source, sha, data, *fs.compare_content(t, i, data))
+        key = (c.verified, len(data) == lost_size)
+        if best is None or key > (best.verified, len(best.data) == lost_size):
+            best = c
+    if best is None:
+        check = (
+            "object lost: " + ",".join(sorted({src for src, _sha in cands}))
+            if cands
+            else "not tracked"
+        )
+    elif best.verified:
+        check = "verified"
+    elif len(best.data) == lost_size:
+        check = "same size"
+    else:
+        check = "size differs"
+    return GitMatch(repo, f"{repo}/{rel}", e, cat, lost_size, best, check)
+
+
 def git_rescue(
     fs: RescueFS,
     under: str,
@@ -205,56 +293,24 @@ def git_rescue(
     if dest is not None:
         dest.mkdir(parents=True, exist_ok=True)
         report_path = dest / f".mbkn-git-rescue-{time.strftime('%Y%m%d-%H%M%S')}.tsv"
-    fh = report_path.open("w", newline="") if report_path else sys.stdout
-    try:
+    repos: set[str] = set()
+    with contextlib.ExitStack() as stack:
+        fh = stack.enter_context(report_path.open("w", newline="")) if report_path else sys.stdout
         rep = csv.writer(fh, delimiter="\t", lineterminator="\n")
         rep.writerow(
             ["path", "category", "source", "check", "sectors_matching", "size", "lost_size",
              "action"]
         )  # fmt: skip
-        repos = find_repos(fs, under)
-        for n, (wt_path, root, git_entry) in enumerate(repos, 1):
-            if not fs.entry_mask(root) & (CAT_BITS[CAT_DAMAGED] | CAT_BITS[CAT_LOST]):
-                continue  # nothing damaged or lost in this work tree
-            files = _worktree_files(fs, root, wt_path, categories)
-            if not files:
-                continue
-            stats.repos += 1
-            if progress:
-                print(
-                    f"\r  repo {n}/{len(repos)}: {wt_path} ({len(files)} files) ",
-                    end="",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            with tempfile.TemporaryDirectory(dir=scratch, prefix="git-rescue-") as tmp:
-                restore(
-                    fs,
-                    git_entry,
-                    Path(tmp),
-                    categories=frozenset({CAT_INTACT, CAT_UNVERIFIED}),
-                    progress=False,
-                )
-                git_dir = Path(tmp) / ".git"
-                _neutralise(git_dir)
-                listing = _listing(git_dir)
-                if not listing:
-                    stats.repos_unreadable += 1
-                wanted = {rel: listing.get(rel, []) for rel in files}
-                blobs = _blobs(git_dir, sorted({s for c in wanted.values() for _src, s in c}))
-                for rel, (e, cat) in files.items():
-                    stats.files += 1
-                    _one(fs, wt_path, rel, e, cat, wanted[rel], blobs, dest, rep, stats)
-        if progress and repos:
-            print(file=sys.stderr)
-    finally:
-        if report_path:
-            fh.close()
+        for m in git_matches(fs, under, categories=categories, scratch=scratch, progress=progress):
+            stats.files += 1
+            repos.add(m.repo)
+            _record(fs, m, dest, rep, stats)
+    stats.repos = len(repos)
     return stats, report_path
 
 
 def _worktree_files(
-    fs: RescueFS, root: Entry, wt_path: str, categories: frozenset[str]
+    fs: RescueFS, root: Entry, categories: frozenset[str]
 ) -> dict[str, tuple[Entry, str]]:
     """{path relative to the work tree: (entry, best category)} of files to recover."""
     out = {}
@@ -270,52 +326,36 @@ def _worktree_files(
     return out
 
 
-def _one(fs, wt_path, rel, e, cat, cands, blobs, dest, rep, stats) -> None:
-    t, i = e.node.tree, e.node.ino
-    path = f"{wt_path}/{rel}"
-    lost_size = fs.layout(t, i).size
-    best: Candidate | None = None
-    for source, sha in cands:
-        data = blobs.get(sha)
-        if data is None:
-            continue
-        c = Candidate(source, sha, data, *fs.compare_content(t, i, data))
-        key = (c.verified, len(data) == lost_size)
-        if best is None or key > (best.verified, len(best.data) == lost_size):
-            best = c
+def _record(fs: RescueFS, m: GitMatch, dest: Path | None, rep, stats: GitStats) -> None:
+    best = m.best
     if best is None:
-        if cands:
-            stats.object_lost += 1
-            check = "object lost: " + ",".join(sorted({src for src, _sha in cands}))
-        else:
+        if m.check == "not tracked":
             stats.untracked += 1
-            check = "not tracked"
-        rep.writerow([path, cat, "", check, "", "", lost_size, "none"])
+        else:
+            stats.object_lost += 1
+        rep.writerow([m.path, m.category, "", m.check, "", "", m.lost_size, "none"])
         return
-    if best.verified:
-        check = "verified"
+    if m.check == "verified":
         stats.verified += 1
-    elif len(best.data) == lost_size:
-        check = "same size"
+    elif m.check == "same size":
         stats.same_size += 1
     else:
-        check = "size differs"
         stats.other += 1
     stats.by_source[best.source] = stats.by_source.get(best.source, 0) + 1
     action = "report"
     if dest is not None:
-        target = dest / path.lstrip("/")
+        target = dest / m.path.lstrip("/")
         if target.exists():
             action = "exists"
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(best.data)
-            info = fs.inode(t, i)
+            info = fs.inode(m.entry.node.tree, m.entry.node.ino)
             if info and best.verified:
                 os.utime(target, (info.atime, info.mtime))
             stats.written += 1
             action = "written"
     rep.writerow(
-        [path, cat, best.source, check, f"{best.matched}/{best.compared}", len(best.data),
-         lost_size, action]
+        [m.path, m.category, best.source, m.check, f"{best.matched}/{best.compared}",
+         len(best.data), m.lost_size, action]
     )  # fmt: skip

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Full test suite before every push (~30 s); CI runs everything again on GitHub.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+uv run --quiet pytest -q -x

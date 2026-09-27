@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import overload
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -97,13 +98,35 @@ CREATE TABLE IF NOT EXISTS sector_patch (
     copied INTEGER, zeros INTEGER, patch BLOB,
     PRIMARY KEY (disk_bytenr, disk_len, egen)
 );
+-- Filled by patching (after categorising): reconstructions best/ serves. source "older":
+-- base_gen version with bad ranges filled (fills = JSON [[start, end, gen], ...]);
+-- source "git:index|stash|HEAD": blob `sha`, content in git_blob (zlib).
+CREATE TABLE IF NOT EXISTS file_patch (
+    tree INTEGER, ino INTEGER, source TEXT, complete INTEGER, detail TEXT,
+    base_gen INTEGER, fills TEXT, sha TEXT, PRIMARY KEY (tree, ino)
+);
+CREATE TABLE IF NOT EXISTS git_blob (sha TEXT PRIMARY KEY, data BLOB);
+-- Filled by `current`: directory entries in the newest tree of each existing subvolume
+-- (what a normal mount shows now).
+CREATE TABLE IF NOT EXISTS current_dirent (
+    tree INTEGER, dir INTEGER, name BLOB, child INTEGER, child_kind INTEGER, ftype INTEGER,
+    PRIMARY KEY (tree, dir, name)
+);
 CREATE TABLE IF NOT EXISTS node_mask (
     tree INTEGER, ino INTEGER, mask INTEGER, PRIMARY KEY (tree, ino)  -- ino -1 = .orphans
 );
 """
 
 ITEM_TABLES = ("chunks", "roots", "root_refs", "inodes", "dirents", "extents")
-CLASSIFY_TABLES = ("extent_status", "file_cat", "node_mask", "best_version", "sector_patch")
+CLASSIFY_TABLES = (
+    "extent_status",
+    "file_cat",
+    "node_mask",
+    "best_version",
+    "sector_patch",
+    "file_patch",
+    "git_blob",
+)
 
 U64 = 1 << 64
 
@@ -142,6 +165,10 @@ def _migrate(con: sqlite3.Connection) -> None:
         con.commit()
 
 
+@overload
+def get_meta(con: sqlite3.Connection, key: str, default: str) -> str: ...
+@overload
+def get_meta(con: sqlite3.Connection, key: str, default: None = None) -> str | None: ...
 def get_meta(con: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
     row = con.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
     return row[0] if row else default

@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.4.0
+
+### Recovery
+- **Reconstructions on by default**: for damaged/lost files `best/` (and `restore`) serve the
+  most complete content - a git blob identical to the lost file, the best version with all
+  bad ranges filled from older versions, a same-size or older git blob, or a partly filled
+  version, in that order. Computed during classification (`--no-patch` to skip) and stored,
+  so the mount needs neither git nor extra work.
+- New mount folder **`patched/`** (exactly the reconstructed files of `best/`) and
+  **`PATCHED.tsv`** (source of each).
+- New mount folder **`current/`**: the disk as a normal mount shows it now - top-level
+  subvolume as root, nested subvolumes in place, only current names - built by walking the
+  newest tree of each subvolume.
+- Filling from older versions now uses every data-backed piece of an older version (a hole
+  inside a bad range no longer prevented filling the rest).
+- `restore --fill-older` is gone (it is the default now); `restore --no-patch` writes the
+  files' own content.
+
+### Fixes (review)
+- `current/` reads the subvolume list from the current root tree (superblock); the earlier
+  guess from the newest root-tree leaves could miss subvolumes whose leaf had not changed.
+- Shell: `gen N` and `exclude` showed cached listings of the previous view.
+- Ctrl-C prints how to continue instead of a traceback.
+- `review --include` rejects unknown categories; `review` says what `best/` serves.
+- `PATCHED.tsv` is proper TSV (escaped names); orphaned files get their `.orphans/` path.
+- A corrupt chunk item with a wrong stripe count no longer aborts parsing.
+- Checking and hashing release the device pages behind them: hashing in a full analysis ran
+  at a third of its speed under a page cache filled by the checking pass (430 MiB/s -> 1.2
+  GiB/s; a whole analysis of 477 GiB takes ~30 min).
+- mypy with `check_untyped_defs`; more tests: DUP data, compressed copies, nested subvolumes
+  in `current/`, the no-superblock fallback, shell view changes.
+
+### Housekeeping
+- `status` (mounts, running commands, analysis state, device access, disk usage), `umount`,
+  `stop` (unmount all, pause analyses; resumable), `clean` (dry run by default; only
+  tool-made files; never inside mounts).
+- The test suite keeps only its last two runs' images (they had grown to 20 GB).
+
+### Checks
+- `scripts/checks.sh`: ruff, ruff format, mypy (now clean), shellcheck, codespell, gitleaks.
+- Git hooks (enabled by `scripts/setup.sh`): checks on commit, tests on push.
+- CI: the same checks, a gitleaks scan of the whole history, tests, `uv build`.
+
 ## 0.3.0
 
 ### Recovery

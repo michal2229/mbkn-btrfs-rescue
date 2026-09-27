@@ -64,6 +64,10 @@ def prepare_extract(
     con.execute("DELETE FROM file_cat")
     con.execute("DELETE FROM node_mask")
     con.execute("DELETE FROM best_version")
+    con.execute("DELETE FROM file_patch")
+    con.execute("DELETE FROM current_dirent")
+    con.execute("DELETE FROM meta WHERE key = 'current_built'")
+    con.execute("DELETE FROM git_blob")
     con.execute("DELETE FROM meta WHERE key LIKE 'classify_%'")
     if get_meta(con, "fsid") != fsid.hex():
         con.execute("DELETE FROM extent_status")

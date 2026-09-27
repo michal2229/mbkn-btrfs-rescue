@@ -12,11 +12,23 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .db import get_meta, set_meta
-from .model import CATEGORIES, CHECK_VERSION, ROOT_INO, DataError, Node, RescueFS
+from .model import (
+    CATEGORIES,
+    CHECK_VERSION,
+    ROOT_INO,
+    DataError,
+    Node,
+    RescueFS,
+    classify_key,
+    patch_serials,
+)
 
 
 def _progress(msg: str) -> None:
     print(f"\r  {msg} ", end="", file=sys.stderr, flush=True)
+
+
+DROP_EVERY = 256 << 20
 
 
 def classify_extents(
@@ -68,7 +80,11 @@ def classify_extents(
     t0 = last = time.monotonic()
     done_bytes = 0
     batch = []
-    for i, (_phys, b, n, g, comp) in enumerate(todo, 1):
+    dropped = 0  # device page cache behind this offset is released (read-ahead included)
+    for i, (at, b, n, g, comp) in enumerate(todo, 1):
+        if at - dropped > DROP_EVERY:
+            fs.dev.drop_cache(dropped, at - dropped)
+            dropped = at
         c = fs.check_extent_raw(b, n, g, quick=quick, comp=comp)
         batch.append((b, n, g, *c[:6]))
         done_bytes += n
@@ -107,6 +123,7 @@ def classify_files(fs: RescueFS, progress: bool = True) -> dict[str, tuple[int, 
     view._cats = {}
     view._best = {}
     view._file_stats = {}
+    view._file_patches = None
     view._gen_views = type(view._gen_views)(64)
     for tree, name, count in view.trees():
         t0 = time.monotonic()
@@ -129,15 +146,38 @@ def print_match(stats: dict[str, int]) -> None:
     )
 
 
+def categorise(
+    fs: RescueFS, scratch: Path | None = None, patch: bool = True, progress: bool = True
+) -> dict[str, tuple[int, int]]:
+    """Categorise files, then (with `patch`) choose reconstructions for damaged/lost files
+    (patching.py) and categorise again so the mount's masks include them."""
+    from .current import build_current
+
+    build_current(fs, progress)
+    totals = classify_files(fs, progress)
+    if patch:
+        from .patching import compute_patches
+
+        had = fs.con.execute("SELECT count(*) FROM file_patch").fetchone()[0]
+        if sum(compute_patches(fs, scratch, progress=progress).values()) or had:
+            totals = classify_files(fs, progress)  # masks must include the patched files
+        else:  # nothing patched: the stored categories stay valid for the new patch serial
+            set_meta(fs.con, "classify_exclude", classify_key(fs.exclude, patch_serials(fs.con)))
+            fs.con.commit()
+    return totals
+
+
 def classify(
     fs: RescueFS,
     trees: set[int] | None = None,
     quick: bool = False,
     progress: bool = True,
     match_dir: Path | None = None,
+    scratch: Path | None = None,
+    patch: bool = True,
 ) -> dict[str, tuple[int, int]]:
     """Check extents, then (with `match_dir`: the sector-hash cache) recover bad sectors from
-    copies, then categorise files."""
+    copies, then categorise files and choose reconstructions (`patch`)."""
     n, total = classify_extents(fs, trees, quick, progress)
     if progress:
         print(f"checked {n} extents ({total / 2**30:.1f} GiB)", file=sys.stderr)
@@ -147,5 +187,5 @@ def classify(
         stats = run_match(fs, match_dir, progress)
         if progress:
             print_match(stats)
-    totals = classify_files(fs, progress)
+    totals = categorise(fs, scratch, patch=patch and not quick, progress=progress)
     return {c: totals.get(c, (0, 0)) for c in CATEGORIES}

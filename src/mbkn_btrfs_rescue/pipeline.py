@@ -13,12 +13,12 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from .classify import classify_extents, classify_files
+from .classify import categorise, classify_extents
 from .compat import device_warnings
 from .db import get_meta, set_meta
 from .device import Device
 from .extract import STAT_KEYS, extract_leaves, fsid_summary, prepare_extract
-from .model import CHECK_VERSION, RescueFS, classify_key
+from .model import CHECK_VERSION, RescueFS, classify_key, patch_serials
 from .ondisk import Superblock
 from .scan import ScanParams, scan
 
@@ -39,7 +39,7 @@ def classification_outdated(con: sqlite3.Connection, exclude: list[str]) -> bool
     """True when stored checks/categories were made by older rules or another exclude list."""
     return int(get_meta(con, "check_version", "1")) < CHECK_VERSION or get_meta(
         con, "classify_exclude"
-    ) != classify_key(exclude, get_meta(con, "patch_serial", ""))
+    ) != classify_key(exclude, patch_serials(con))
 
 
 def _status(con: sqlite3.Connection, text: str, echo: bool) -> None:
@@ -89,6 +89,8 @@ def analyze(
     echo: bool = True,
     stop: Callable[[], bool] | None = None,
     match_dir: Path | None = None,
+    scratch: Path | None = None,
+    patch: bool = True,
 ) -> str:
     """Run the remaining stages. Returns the final state."""
     state = get_meta(con, STATE_KEY) or "scanning"
@@ -135,8 +137,8 @@ def analyze(
 
             _status(con, "classifying: recovering bad sectors from copies", echo)
             run_match(fs, match_dir, progress=echo, report=lambda m: _status(con, m, False))
-        _status(con, "classifying: categorising files", echo)
-        classify_files(fs, progress=echo)
+        _status(con, "classifying: categorising files, reconstructing damaged/lost ones", echo)
+        categorise(fs, scratch, patch=patch and not quick, progress=echo)
         set_meta(con, STATE_KEY, "complete")
         con.commit()
         state = "complete"

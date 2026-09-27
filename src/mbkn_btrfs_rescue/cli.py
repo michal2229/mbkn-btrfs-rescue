@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -243,8 +244,6 @@ def _categories_from_args(args) -> frozenset[str]:
     cats = set(DEFAULT_CATEGORIES)
     for item in args.include or []:
         cats |= set(CATEGORIES) if item == "all" else {item}
-    if getattr(args, "fill_older", False):
-        cats.add("damaged")
     return frozenset(cats)
 
 
@@ -276,12 +275,12 @@ def cmd_restore(args, cfg):
             overwrite=args.overwrite,
             include_stale=args.include_stale,
             best=not args.latest,
-            fill_older=args.fill_older,
+            patch=not args.no_patch,
         )
         print(
             f"wrote {stats.files} files ({fmt_size(stats.bytes)}), {stats.links} symlinks, "
             f"{stats.older_versions} from an older (better) version, "
-            f"{stats.filled} damaged files filled from older versions; "
+            f"{stats.patched} reconstructed (older versions / git, as in best/); "
             f"skipped {stats.skipped_category} by category, {stats.skipped} already existing"
         )
         print(f"categories seen: {stats.by_category}  (written: {', '.join(sorted(cats))})")
@@ -292,10 +291,12 @@ def cmd_restore(args, cfg):
 def cmd_review(args, cfg):
     import contextlib
 
-    from .model import ROOT
+    from .model import CATEGORIES, ROOT
     from .review import DEFAULT_REVIEW, review
 
     cats = tuple(args.include.split(",")) if args.include else DEFAULT_REVIEW
+    if unknown := set(cats) - set(CATEGORIES):
+        raise SystemExit(f"unknown categories: {', '.join(sorted(unknown))} (use {CATEGORIES})")
     counts: dict[str, int] = {}
     with _device(args, cfg) as dev, contextlib.ExitStack() as stack:
         fs = _open_fs(args, cfg, dev)
@@ -316,6 +317,80 @@ def cmd_review(args, cfg):
     summary = ", ".join(f"{n} {c}" for c, n in sorted(counts.items())) or "nothing to review"
     print(summary + (f" -> {args.output}" if args.output else ""), file=sys.stderr)
     return 0
+
+
+def cmd_status(args, cfg):
+    from .tools import status
+
+    print(status(cfg, _db_path(args, cfg)))
+    return 0
+
+
+def cmd_umount(args, cfg):
+    from .tools import our_mounts, umount
+
+    points = args.mountpoint or our_mounts()
+    if not points:
+        print("nothing mounted")
+        return 0
+    failed = umount(points, lazy=args.lazy)
+    for m in points:
+        err = dict(failed).get(m)
+        print(f"{m}: {'FAILED - ' + err if err else 'unmounted'}")
+    if failed and not args.lazy:
+        print(
+            "a program is still using it (a shell cd'ed there, a file manager); close it or "
+            "use --lazy (detaches now, finishes when it is no longer used)"
+        )
+    return 1 if failed else 0
+
+
+def cmd_stop(args, cfg):
+    from .tools import our_mounts, our_processes, stop
+
+    mounts, procs = our_mounts(), our_processes()
+    if not mounts and not procs:
+        print("nothing running")
+        return 0
+    problems = stop(force=args.force)
+    print(
+        f"unmounted {len(mounts)}, stopped {len(procs)} commands (analyses resume on the next run)"
+        if not problems
+        else "\n".join(problems)
+    )
+    return 1 if problems else 0
+
+
+def cmd_clean(args, cfg):
+    from .tools import clean_items, fmt, remove, untouched
+
+    items = clean_items(cfg, hashes=args.hashes)
+    for i in items:
+        print(f"  {fmt(i.size):>8}  {i.label:18} {i.path}")
+    total = sum(i.size for i in items)
+    other = untouched(cfg, items)
+    if other:
+        print("kept (not created by this tool, or your data):")
+        for p in other:
+            print(f"            {p}{'  (mount point)' if os.path.ismount(p) else ''}")
+    if not items:
+        print("nothing to clean")
+        return 0
+    if not args.yes:
+        print(
+            f"would free {fmt(total)}; run again with --yes to delete"
+            + ("" if args.hashes else " (--hashes also removes the sector-hash cache)")
+        )
+        return 0
+    skipped = remove(items)
+    for s in skipped:
+        print(f"skipped {s}")
+    print(f"freed {fmt(total)}")
+    return 0
+
+
+def _db_path(args, cfg) -> Path:
+    return Path(args.db) if args.db else cfg.db_path
 
 
 def cmd_git_rescue(args, cfg):
@@ -346,8 +421,15 @@ def cmd_classify(args, cfg):
     with _device(args, cfg) as dev:
         fs = _open_fs(args, cfg, dev)
         trees = {int(t) for t in args.trees.split(",")} if args.trees else None
-        match_dir = None if args.no_match or trees else _db(args, cfg)[1].parent
-        totals = classify(fs, trees=trees, quick=args.quick, match_dir=match_dir)
+        match_dir = None if args.no_match or trees else _db_path(args, cfg).parent
+        totals = classify(
+            fs,
+            trees=trees,
+            quick=args.quick,
+            match_dir=match_dir,
+            scratch=cfg.tmp_dir,
+            patch=not args.no_patch,
+        )
         if get_meta(fs.con, "scan_done") == "1":
             fs.con.execute("INSERT OR REPLACE INTO meta VALUES (?, 'complete')", (STATE_KEY,))
             fs.con.commit()
@@ -356,15 +438,15 @@ def cmd_classify(args, cfg):
 
 
 def cmd_match(args, cfg):
-    from .classify import classify_files, print_match
+    from .classify import categorise, print_match
     from .match import run_match
 
     with _device(args, cfg) as dev:
         fs = _open_fs(args, cfg, dev)
         if not fs.con.execute("SELECT 1 FROM extent_status LIMIT 1").fetchone():
             raise SystemExit("no checked extents yet - run `classify` first")
-        print_match(run_match(fs, _db(args, cfg)[1].parent))
-        totals = classify_files(fs)
+        print_match(run_match(fs, _db_path(args, cfg).parent))
+        totals = categorise(fs, cfg.tmp_dir)
     _print_totals(totals)
     return 0
 
@@ -385,6 +467,8 @@ def cmd_analyze(args, cfg):
             exclude=_exclude(args, cfg),
             quick=args.quick,
             match_dir=None if args.no_match else path.parent,
+            scratch=cfg.tmp_dir,
+            patch=not args.no_patch,
         )
         _print_totals(RescueFS(con, dev, exclude=_exclude(args, cfg)).category_totals())
     return 0
@@ -431,6 +515,7 @@ def cmd_mount(args, cfg):
                         exclude=exclude,
                         echo=False,
                         match_dir=db_path.parent,
+                        scratch=cfg.tmp_dir,
                     )
                 except Exception as err:
                     set_meta(wcon, STATUS_KEY, f"ERROR: {err!r} (see {log_path})")
@@ -475,6 +560,9 @@ def _quote(s: str) -> str:
 
 
 # ---------------------------------------------------------------------------- parser
+
+
+NO_PATCH_HELP = "do not reconstruct damaged/lost files (older versions, git) for best/"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -554,6 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--quick", action="store_true", help="sample 3 sectors per extent")
     s.add_argument("--restart", action="store_true", help="discard previous progress")
     s.add_argument("--no-match", action="store_true", help="skip recovery from copies")
+    s.add_argument("--no-patch", action="store_true", help=NO_PATCH_HELP)
     view_opts(s)
     s.set_defaults(func=cmd_analyze)
 
@@ -561,8 +650,26 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--trees", help="comma-separated fs tree ids to check (default: all)")
     s.add_argument("--quick", action="store_true", help="sample 3 sectors per extent")
     s.add_argument("--no-match", action="store_true", help="skip recovery from copies")
+    s.add_argument("--no-patch", action="store_true", help=NO_PATCH_HELP)
     view_opts(s)
     s.set_defaults(func=cmd_classify)
+
+    s = sub.add_parser("status", help="mounts, running commands, progress, disk usage")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("umount", help="unmount this tool's FUSE mounts (default: all)")
+    s.add_argument("mountpoint", nargs="*")
+    s.add_argument("--lazy", action="store_true", help="detach even if in use")
+    s.set_defaults(func=cmd_umount)
+
+    s = sub.add_parser("stop", help="unmount everything and pause running analyses")
+    s.add_argument("--force", action="store_true", help="SIGTERM instead of SIGINT")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("clean", help="remove test images, scratch dirs, logs (dry run first)")
+    s.add_argument("--yes", action="store_true", help="really delete")
+    s.add_argument("--hashes", action="store_true", help="also the sector-hash cache")
+    s.set_defaults(func=cmd_clean)
 
     s = sub.add_parser(
         "git-rescue", help="recover lost/damaged files of git work trees from .git (TSV)"
@@ -610,10 +717,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="always write the newest version (default: best version, as in the mount's best/)",
     )
     s.add_argument(
-        "--fill-older",
+        "--no-patch",
         action="store_true",
-        help="damaged files: fill bad ranges with good data of older versions (may be older "
-        "content; listed in the report). Implies --include damaged",
+        help="write damaged/lost files' own content, not the reconstructions best/ shows",
     )
     view_opts(s)
     s.set_defaults(func=cmd_restore)
@@ -653,3 +759,6 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except BrokenPipeError:
         return 0
+    except KeyboardInterrupt:
+        print("\ninterrupted - run the same command again to continue", file=sys.stderr)
+        return 130

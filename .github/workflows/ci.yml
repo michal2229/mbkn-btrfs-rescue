@@ -12,14 +12,22 @@ jobs:
     container: fedora:latest
     steps:
       - name: System packages
-        run: dnf install -y --setopt=install_weak_deps=False btrfs-progs fuse3 fuse3-libs git
+        run: |
+          dnf install -y --setopt=install_weak_deps=False \
+            btrfs-progs fuse3 fuse3-libs git gitleaks
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for the secret scan
       - uses: astral-sh/setup-uv@v6
       - name: Install
         run: uv sync --all-extras
-      - name: Lint
+      - name: Static checks (ruff, mypy, shellcheck, codespell)
+        run: scripts/checks.sh
+      - name: Secret scan (whole history)
         run: |
-          uv run ruff check .
-          uv run ruff format --check .
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          gitleaks git --no-banner --redact .
       - name: Tests (the kernel FUSE mount test skips without /dev/fuse)
         run: uv run pytest -q
+      - name: Build package
+        run: uv build

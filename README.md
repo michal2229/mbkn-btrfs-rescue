@@ -14,10 +14,14 @@ tree bottom-up from the leaves, and lets you:
   checksums sector by sector (and, where no checksum survives, whether the data is plausible),
 * **recover bad sectors from identical copies** elsewhere on the disk (plain copies of files,
   other subvolumes, DUP mirrors, old locations), found by their expected checksums,
-* get the **best version** of every file automatically: the newest one, or an older one when
-  the newest is broken (`best/` in the mount, default for `restore`),
+* get the **most complete version** of every file automatically (`best/` in the mount, default
+  for `restore`): the newest good one, an older one when the newest broke, and for damaged or
+  lost files a reconstruction - bad ranges filled from older versions, or the file's content
+  from its git repository - listed separately in `patched/` and `PATCHED.tsv`,
 * bring back **lost source files from git**: staged, stashed or committed content of lost
-  work-tree files, verified against the lost file's checksums (`git-rescue`),
+  work-tree files, verified against the lost file's checksums (automatic in `best/`;
+  `git-rescue` for a report),
+* see the disk **as a normal mount would show it now** (`current/`),
 * **review** what needs a human look: unverified and damaged files with their bad byte ranges,
 * **restore** only what is salvageable (by default), with a report,
 * go back to **any older version** of files (`history/gen-N/`, `--at-gen`),
@@ -34,6 +38,8 @@ scripts/setup.sh --device /dev/mapper/luks-XXXX      # uv env + local config + d
 scripts/device-access.sh grant                       # sudo: freeze read-only + read ACL
 
 uv run mbkn-btrfs-rescue mount ~/rescue              # mounts at once, analyses in background
+uv run mbkn-btrfs-rescue status                      # (another terminal) progress, what runs
+uv run mbkn-btrfs-rescue stop                        # when done: unmount, pause analyses
 ```
 
 Open `~/rescue` in any file manager:
@@ -41,13 +47,16 @@ Open `~/rescue` in any file manager:
 ```
 ~/rescue/
   README.txt          what everything means + live analysis progress
-  best/               newest good version of each file (older one if newest broke) <- start here
+  PATCHED.tsv         where each reconstructed file in best/ came from
+  best/               the most complete version of every file            <- start here
+  patched/            the files of best/ that are reconstructed (check these)
   intact/             content verified by btrfs checksums
   unverified/         no checksum on record, probably fine
   damaged/            partially readable
   lost/               names and metadata only, content gone
   all/                everything readable, newest version of each file
   history/gen-N/      everything as it was up to generation N
+  current/            the disk as a normal mount shows it now
 ```
 
 Each folder keeps the original paths (`<subvolume>@<id>/path/to/file`). The mount refreshes
@@ -61,24 +70,32 @@ uv run mbkn-btrfs-rescue shell                       # ls / cd / find / grep / s
 uv run mbkn-btrfs-rescue restore /_work@260/proj ~/recovered   # best versions, good files only
 uv run mbkn-btrfs-rescue git-rescue /_work@260 --dest ~/recovered-git   # lost files from .git
 uv run mbkn-btrfs-rescue review -o ~/review.tsv      # what to check by hand
+uv run mbkn-btrfs-rescue clean                       # remove test images, scratch, logs
 ```
 
 ### Getting the most back
 
-1. `best/` (or `restore`) - verified content, older versions where the newest broke, and bad
-   sectors already replaced from identical copies found on the disk.
-2. `git-rescue` - lost files of git work trees from the index, the stash or HEAD. `verified`
-   rows are byte-identical to the lost file; others are the last committed/staged version.
-3. `review` - unverified and damaged files with the exact bad byte ranges; for damaged files,
-   `restore --fill-older` fills those ranges from older versions (marked in the report).
-4. `lost/` - what existed (names, sizes, dates), to know what to recreate.
+Everything below runs by default during the analysis; `best/` (and `restore`) serve the result.
+For each file, `best/` has the first of these that exists:
+
+1. verified content: the newest version that is intact (or unverified but plausible), else an
+   older one; bad sectors already replaced by identical copies found on the disk,
+2. a git blob byte-identical to the lost file (index, stash or HEAD),
+3. the best damaged version with all bad ranges filled from older versions,
+4. a git blob of the same size, then 5. an older git blob of another size,
+6. the best damaged version, partly filled or as it is.
+
+Cases 2-6 are also in `patched/` and `PATCHED.tsv` (with their source): check those first.
+`review` lists unverified and damaged files with the exact bad byte ranges; `lost/` shows what
+existed (names, sizes, dates), to know what to recreate.
 
 ### Copy from `best/` or use `restore`?
 
 Both give the same bytes: `restore` writes exactly the versions `best/` shows. Copying from
 `best/` with a file manager or `cp -a` is fine for picking files by hand. `restore` adds:
 
-* only intact + unverified files by default (`best/` also contains damaged ones),
+* only intact, unverified and completely reconstructed files by default (`best/` also has
+  damaged ones),
 * a TSV report of every file with category, sector counts and which version was used,
 * no FUSE needed, never overwrites existing files unless `--overwrite`,
 * speed: reads straight from the device, without the FUSE round trips.
@@ -89,7 +106,8 @@ fine; `best/` additionally has the rescued older versions.
 ## Requirements
 
 * Linux, Python ≥ 3.14, [uv](https://docs.astral.sh/uv/)
-* for FUSE: `fuse3` (`fusermount3`); for tests: `btrfs-progs` (`mkfs.btrfs`)
+* for FUSE: `fuse3` (`fusermount3`); for reconstructions from git repositories: `git`
+* for tests: `btrfs-progs` 6.12+ (`mkfs.btrfs --rootdir` with subvolumes)
 * read access to the device (see `scripts/device-access.sh`)
 
 ## Compatibility

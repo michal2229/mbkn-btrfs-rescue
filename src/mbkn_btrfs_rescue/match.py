@@ -86,7 +86,12 @@ def match_copies(fs: RescueFS, hashes: np.ndarray, progress: bool = True) -> dic
     i = 0
     while i < len(targets):
         # --- one batch of extents: expected keys of every sector
-        batch, keys_l, ext_l, idx_l, bad_l, sums = [], [], [], [], [], []
+        batch: list[tuple] = []
+        keys_l: list[np.ndarray] = []
+        ext_l: list[np.ndarray] = []
+        idx_l: list[np.ndarray] = []
+        bad_l: list[np.ndarray] = []
+        sums: list[list[bytes | None]] = []
         size = 0
         while i < len(targets) and (size < BATCH_SECTORS or not batch):
             key = targets[i]
@@ -175,9 +180,9 @@ def match_copies(fs: RescueFS, hashes: np.ndarray, progress: bool = True) -> dic
             kind = np.zeros(nsect, dtype=np.uint8)
             zeros = bad & have & (k == zkey)
             kind[zeros] = PATCH_ZERO
-            for s in np.flatnonzero(bad & have & ~zeros):
-                if (j, int(s)) in ok:
-                    phys[s] = choice[(j, int(s))] * ss
+            for s in np.flatnonzero(bad & have & ~zeros).tolist():
+                if (j, s) in ok:
+                    phys[s] = choice[(j, s)] * ss
                     kind[s] = PATCH_COPY
             nz, ns = int((kind == PATCH_ZERO).sum()), int((kind == PATCH_COPY).sum())
             if nz + ns:

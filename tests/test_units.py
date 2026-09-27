@@ -156,3 +156,13 @@ def test_sniff_file_types():
     assert plausible(".gitignore", b"*.pyc\n") is True
     assert plausible("data.bin", garbage) is None  # unknown type: no opinion
     assert plausible("x.png", b"") is None
+
+
+def test_range_helpers():
+    from mbkn_btrfs_rescue.model import _intersect, _subtract
+
+    assert _subtract([(0, 100)], [(10, 20), (50, 60)]) == [(0, 10), (20, 50), (60, 100)]
+    assert _subtract([(0, 10)], [(0, 10)]) == []
+    # a bad range filled only where the older version has data (a hole in between)
+    assert _intersect([(0, 100)], [(0, 30), (70, 90)]) == [(0, 30), (70, 90)]
+    assert _intersect([(10, 20), (40, 80)], [(0, 50)]) == [(10, 20), (40, 50)]

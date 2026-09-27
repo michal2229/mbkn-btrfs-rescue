@@ -47,7 +47,8 @@ CAT_BITS = {c: 1 << i for i, c in enumerate(CATEGORIES)}
 CAT_RANK = {c: i for i, c in enumerate(CATEGORIES)}  # lower = better content
 GOOD_CATS = (CAT_INTACT, CAT_UNVERIFIED)
 BEST_BIT = 1 << len(CATEGORIES)  # mask bit: something readable in the best/ view
-MASK_VERSION = 7  # bump when mask semantics change (forces re-classification)
+PATCH_BIT = BEST_BIT << 1  # mask bit: a file served reconstructed in best/ (see patching.py)
+MASK_VERSION = 8  # bump when mask semantics change (forces re-classification)
 MAX_VERSIONS = 64  # older versions tried per file when looking for better content
 CAT_HELP = {
     CAT_INTACT: "content verified against btrfs checksums (or stored inline in metadata)",
@@ -202,6 +203,7 @@ class RescueFS:
         self.dev = dev
         self.exclude = set(exclude or [])
         self.at_gen = at_gen
+        self.current = False  # current(): only names in the newest trees, as mounted
         self.nodesize = int(get_meta(con, "nodesize", "16384"))
         self.sectorsize = int(get_meta(con, "sectorsize", "4096"))
         self.csum_type = int(get_meta(con, "csum_type", "0"))
@@ -229,6 +231,7 @@ class RescueFS:
         self._file_stats: dict[tuple, tuple[int, float]] = {}  # size, fraction of bad sectors
         self._best: dict[tuple, tuple[int | None, str]] = {}
         self._best_stored = False
+        self._file_patches: dict[tuple[int, int], FilePatch] | None = None
         self._gen_views = _LRU(64)
         self._masks: dict[tuple[int, int], int] | None = None
         self._masks_valid_for: frozenset[str] | None = None
@@ -244,6 +247,13 @@ class RescueFS:
         view._orphans = self._orphans  # orphan detection ignores at_gen
         view._masks = None
         view._best_stored = False
+        return view
+
+    def current_view(self) -> RescueFS:
+        """What a normal mount shows now: the top-level subvolume as root, nested subvolumes
+        where they are mounted, only names present in the newest trees (see current.py)."""
+        view = self.at(None)
+        view.current = True
         return view
 
     def view_at(self, gen: int | None) -> RescueFS:
@@ -355,6 +365,10 @@ class RescueFS:
         return hit
 
     def _list_children(self, node: Node) -> dict[str, Entry]:
+        if self.current:
+            return self._list_current(
+                Node(od.FS_TREE, ROOT_INO) if node.kind == KIND_ROOT else node
+            )
         if node.kind == KIND_ROOT:
             return {
                 f"{name}@{t}": Entry(f"{name}@{t}", Node(t, ROOT_INO), od.FT_DIR)
@@ -386,6 +400,22 @@ class RescueFS:
         self._mark_stale(node, inode_entries)
         if node.ino == ROOT_INO and self.orphans(node.tree):
             out[ORPHANS_NAME] = Entry(ORPHANS_NAME, Node(node.tree, 0, KIND_ORPHANS), od.FT_DIR)
+        return out
+
+    def _list_current(self, node: Node) -> dict[str, Entry]:
+        out: dict[str, Entry] = {}
+        for name_b, child, kind, ftype in self.con.execute(
+            "SELECT name, child, child_kind, ftype FROM current_dirent WHERE tree=? AND dir=?",
+            (node.tree, node.ino),
+        ):
+            name = fsname(name_b)
+            if name in self.exclude or name in ("", ".", "..") or "/" in name:
+                continue
+            if kind == od.ROOT_ITEM:  # nested subvolume, mounted here
+                out[name] = Entry(name, Node(child, ROOT_INO), od.FT_DIR)
+            else:
+                out[name] = Entry(name, Node(node.tree, child), ftype)
+        self._fill_types(node.tree, [e for e in out.values() if e.node.tree == node.tree])
         return out
 
     def _fill_types(self, tree: int, entries: list[Entry]) -> None:
@@ -570,6 +600,7 @@ class RescueFS:
         extent generation, then written data over holes/preallocated space from the same
         transaction (fallocate + write turns a prealloc item into a data item).
         """
+        args: tuple[int, ...]
         if self.at_gen is None:
             seen, clause, args = "gen_max", "", ()
         else:
@@ -642,7 +673,7 @@ class RescueFS:
         if key in self._decoded:
             return self._decoded[key]
         raw = (
-            row.inline
+            (row.inline or b"")
             if row.etype == od.FILE_EXTENT_INLINE
             else self._read_extent(row.disk_bytenr, row.disk_len, row.egen, 0, row.disk_len)
         )
@@ -690,12 +721,11 @@ class RescueFS:
         if not len(sel):
             return data
         out = bytearray(data.ljust(length, b"\0"))
-        for s in sel:
-            s = int(s)
-            lo, hi = max(start, s * ss), min(start + length, (s + 1) * ss)
-            zero = kind[s] == PATCH_ZERO
-            sector = bytes(ss) if zero else self.dev.pread(ss, int(phys[s]))
-            out[lo - start : hi - start] = sector[lo - s * ss : hi - s * ss]
+        for sn in sel.tolist():
+            lo, hi = max(start, sn * ss), min(start + length, (sn + 1) * ss)
+            zero = kind[sn] == PATCH_ZERO
+            sector = bytes(ss) if zero else self.dev.pread(ss, int(phys[sn]))
+            out[lo - start : hi - start] = sector[lo - sn * ss : hi - sn * ss]
         return bytes(out)
 
     # ------------------------------------------------------------------ sector patches
@@ -891,7 +921,9 @@ class RescueFS:
         else:
             sums = self._data_csums(disk_bytenr, nsect, egen)
             idx = sorted({0, nsect // 2, nsect - 1}) if quick else range(nsect)
-            data = None if quick else self.dev.pread(nsect * ss, phys[0])
+            data = None
+            if not quick:
+                data = self.dev.pread(nsect * ss, phys[0])
             good = bad = nocsum = zero = 0
             states = bytearray(nsect)
             for i in idx:
@@ -954,7 +986,7 @@ class RescueFS:
         key = (tree, ino, self.at_gen)
         hit = self._cats.get(key)
         if hit is not None and hit[1] is not None:
-            return hit
+            return hit[0], hit[1]
         lay = self.layout(tree, ino)
         good = bad = nocsum = unmapped = copied = 0
         ss = self.sectorsize
@@ -1083,18 +1115,17 @@ class RescueFS:
                 match += self._csum(data) == sums[s]
         return match, compared
 
-    def _has_data(self, tree: int, ino: int, lo: int, hi: int) -> bool:
-        """True if [lo, hi) is fully covered by data (not holes/prealloc) in this view."""
-        at = lo
+    def data_ranges(self, tree: int, ino: int) -> list[tuple[int, int]]:
+        """[start, end) ranges backed by data (inline or on-disk extents, not holes), merged."""
+        out: list[tuple[int, int]] = []
         for a, b, row in self.layout(tree, ino).segments:
-            if b <= at or a >= hi:
+            if not (row.is_data or row.etype == od.FILE_EXTENT_INLINE):
                 continue
-            if a > at or not (row.is_data or row.etype == od.FILE_EXTENT_INLINE):
-                return False
-            at = b
-            if at >= hi:
-                return True
-        return at >= hi
+            if out and out[-1][1] == a:
+                out[-1] = (out[-1][0], b)
+            else:
+                out.append((a, b))
+        return out
 
     def _name_of(self, tree: int, ino: int) -> str:
         row = self.con.execute(
@@ -1182,6 +1213,47 @@ class RescueFS:
         self._best[key] = best
         return best
 
+    def file_patch(self, tree: int, ino: int) -> FilePatch | None:
+        """The reconstruction best/ serves for a file (latest view only), or None."""
+        if self.at_gen is not None:
+            return None
+        if self._file_patches is None:
+            self._file_patches = {
+                (t, i): FilePatch(src, bool(c), d, g, json.loads(f) if f else [], sha)
+                for t, i, src, c, d, g, f, sha in self.con.execute(
+                    "SELECT tree, ino, source, complete, detail, base_gen, fills, sha "
+                    "FROM file_patch"
+                )
+            }
+        return self._file_patches.get((tree, ino))
+
+    def best_reader(self, entry: Entry) -> RescueFS | PatchedFile:
+        """What best/ serves for `entry`: a reconstruction, or the best version's view."""
+        if not entry.is_dir and entry.ftype != od.FT_SYMLINK:
+            patch = self.file_patch(entry.node.tree, entry.node.ino)
+            if patch is not None:
+                return PatchedFile(self, entry.node.tree, entry.node.ino, patch)
+        return self.best_entry_view(entry)
+
+    def older_fills(self, tree: int, ino: int) -> tuple[list[tuple[int, int, int]], int]:
+        """Good data of older versions for this view's bad ranges, newest version first.
+
+        Returns ([(start, end, generation)], bad bytes left unfilled).
+        """
+        todo = [(a, b) for a, b, kind in self.problem_ranges(tree, ino) if kind == "bad"]
+        fills: list[tuple[int, int, int]] = []
+        for gen in self.version_gens(tree, ino):
+            if not todo:
+                break
+            old = self.view_at(gen)
+            size = old.layout(tree, ino).size
+            bad_old = [(a, b) for a, b, _k in old.problem_ranges(tree, ino)]
+            data = old.data_ranges(tree, ino)
+            done = _intersect(_subtract([(a, min(b, size)) for a, b in todo], bad_old), data)
+            fills += [(lo, hi, gen) for lo, hi in done]
+            todo = _subtract(todo, done)
+        return sorted(fills), sum(b - a for a, b in todo)
+
     def best_entry_view(self, entry: Entry) -> RescueFS:
         """The view to stat/read `entry` from in the best/ folder."""
         if entry.is_dir or entry.ftype == od.FT_SYMLINK:
@@ -1216,7 +1288,7 @@ class RescueFS:
         return self._masks_valid
 
     def _classify_key(self) -> str:
-        return classify_key(self.exclude, get_meta(self.con, "patch_serial", ""))
+        return classify_key(self.exclude, patch_serials(self.con))
 
     def classified(self) -> bool:
         return get_meta(self.con, "classify_exclude") is not None
@@ -1242,13 +1314,16 @@ class RescueFS:
             bits = CAT_BITS[cat]
             if entry.ftype == od.FT_SYMLINK:
                 return bits | BEST_BIT
-            if self.best_version(entry.node.tree, entry.node.ino)[1] != CAT_LOST:
+            if self.file_patch(entry.node.tree, entry.node.ino) is not None:
+                bits |= BEST_BIT | PATCH_BIT
+            elif self.best_version(entry.node.tree, entry.node.ino)[1] != CAT_LOST:
                 bits |= BEST_BIT
             return bits
         return self.dir_mask(entry.node)
 
     def dir_mask(self, node: Node) -> int:
         self._load_masks()
+        assert self._masks is not None
         key = self._mask_key(node)
         if key in self._masks:
             return self._masks[key]
@@ -1276,6 +1351,7 @@ class RescueFS:
         return self._masks[key]
 
     def dir_mask_cached(self, entry: Entry) -> int:
+        assert self._masks is not None
         return self._masks.get(self._mask_key(entry.node), 0)
 
     def save_classification(self) -> None:
@@ -1319,10 +1395,114 @@ class RescueFS:
         return out
 
 
+def patch_serials(con: sqlite3.Connection) -> str:
+    """Identifies the stored sector patches (match) and file patches (patching)."""
+    return f"{get_meta(con, 'patch_serial', '')}/{get_meta(con, 'file_patch_serial', '')}"
+
+
 def classify_key(exclude, patch_serial: str = "") -> str:
     """Identifies stored categories: valid only for these rules, this exclude list and these
     sector patches."""
     return json.dumps({"v": MASK_VERSION, "exclude": sorted(exclude), "patches": patch_serial})
+
+
+@dataclass
+class FilePatch:
+    """How best/ reconstructs a file (see patching.py).
+
+    source "older": the best version (`base_gen`, None = latest) with bad ranges replaced by
+    good data of older versions (`fills`: [start, end, generation]). source "git:<where>": the
+    blob `sha` from the repository (content stored in git_blob).
+    """
+
+    source: str
+    complete: bool  # no bad bytes left
+    detail: str
+    base_gen: int | None = None
+    fills: list = field(default_factory=list)
+    sha: str | None = None
+
+
+class PatchedFile:
+    """Read access to a reconstructed file, shaped like the RescueFS calls best/ uses."""
+
+    def __init__(self, fs: RescueFS, tree: int, ino: int, patch: FilePatch):
+        self.fs, self.tree, self.ino, self.patch = fs, tree, ino, patch
+        self.base = fs.view_at(patch.base_gen)
+        self._blob: bytes | None = None
+
+    def _git_data(self) -> bytes:
+        if self._blob is None:
+            row = self.fs.con.execute(
+                "SELECT data FROM git_blob WHERE sha=?", (self.patch.sha,)
+            ).fetchone()
+            self._blob = zlib.decompress(row[0]) if row else b""
+        return self._blob
+
+    @property
+    def size(self) -> int:
+        if self.patch.sha:
+            return len(self._git_data())
+        return self.base.layout(self.tree, self.ino).size
+
+    def stat(self, entry: Entry) -> dict:
+        return self.base.stat(entry) | {"st_size": self.size}
+
+    def inode(self, tree: int, ino: int) -> InodeInfo | None:
+        return self.base.inode(tree, ino)
+
+    def read(
+        self, tree: int, ino: int, offset: int, size: int, errors: list[str] | None = None
+    ) -> bytes:
+        if self.patch.sha:
+            return self._git_data()[offset : offset + size]
+        out = bytearray(self.base.read(tree, ino, offset, size, errors))
+        end = offset + len(out)
+        for a, b, gen in self.patch.fills:
+            lo, hi = max(a, offset), min(b, end)
+            if lo < hi:
+                out[lo - offset : hi - offset] = self.fs.view_at(gen).read(tree, ino, lo, hi - lo)
+        return bytes(out)
+
+    def iter_content(
+        self, tree: int, ino: int, block: int = 8 << 20, errors: list[str] | None = None
+    ) -> Iterator[bytes]:
+        for off in range(0, self.size, block):
+            yield self.read(tree, ino, off, block, errors)
+
+    def readlink(self, tree: int, ino: int) -> str:
+        return os.fsdecode(self.read(tree, ino, 0, 4096))
+
+
+def _intersect(ranges, other):
+    """Parts of `ranges` covered by `other` (both sorted lists of [start, end))."""
+    out = []
+    for a, b in ranges:
+        for c, d in other:
+            lo, hi = max(a, c), min(b, d)
+            if lo < hi:
+                out.append((lo, hi))
+    return out
+
+
+def _subtract(ranges, cuts):
+    """Parts of `ranges` not covered by `cuts` (lists of [start, end))."""
+    out = []
+    for a, b in ranges:
+        parts = [(a, b)]
+        for c, d in cuts:
+            nxt = []
+            for x, y in parts:
+                if d <= x or c >= y:
+                    nxt.append((x, y))
+                    continue
+                if x < c:
+                    nxt.append((x, c))
+                if d < y:
+                    nxt.append((d, y))
+            parts = nxt
+        out += [(x, y) for x, y in parts if y > x]
+    return out
 
 
 def paint(rows: Iterator[ExtentRow] | list[ExtentRow]) -> list[tuple[int, int, ExtentRow]]:

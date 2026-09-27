@@ -477,6 +477,8 @@ def parse_chunk(logical: int, data: bytes | memoryview) -> tuple[Chunk, int]:
     length, _owner, _stripe_len, typ, _ia, _iw, _ss, nstripes, _sub = _CHUNK.unpack_from(data, 0)
     stripes = []
     for i in range(nstripes):
+        if 48 + (i + 1) * 32 > len(data):  # corrupt count: keep the stripes that are there
+            break
         devid, off, _uuid = _STRIPE.unpack_from(data, 48 + i * 32)
         stripes.append((devid, off))
     return Chunk(logical, length, typ, nstripes, stripes), 48 + nstripes * 32

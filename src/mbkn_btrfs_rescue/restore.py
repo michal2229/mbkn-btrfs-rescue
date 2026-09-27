@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import ondisk as od
-from .model import CAT_DAMAGED, CAT_INTACT, CAT_UNVERIFIED, Entry, RescueFS
+from .model import CAT_INTACT, CAT_UNVERIFIED, Entry, PatchedFile, RescueFS
 
 
 @dataclass
@@ -24,7 +24,7 @@ class RestoreStats:
     problems: int = 0
     skipped_category: int = 0
     older_versions: int = 0
-    filled: int = 0  # damaged files with bad ranges filled from older versions
+    patched: int = 0  # reconstructions written (as best/ serves them)
     by_category: dict[str, int] = field(default_factory=dict)
 
 
@@ -40,7 +40,7 @@ def restore(
     overwrite: bool = False,
     include_stale: bool = False,
     best: bool = True,
-    fill_older: bool = False,
+    patch: bool = True,
     progress: bool = True,
 ) -> tuple[RestoreStats, Path]:
     """Copy `entry` (file or directory tree) to dest/<name>.
@@ -50,9 +50,10 @@ def restore(
     whose (chosen version's) category is in `categories` are written; the others are listed
     in the TSV report as skipped. Directories left empty by the filter are removed again.
 
-    With `fill_older`, bad ranges of damaged files are filled from the newest older version
-    that has good data there. That content can be older than the rest of the file; the report
-    lists every filled range and its generation.
+    With `patch` (default, with `best`), damaged and lost files are written reconstructed the
+    way best/ serves them (patching.py: bad ranges filled from older versions, content from
+    git). Complete reconstructions are written by default; partial ones only when damaged
+    files are included. The report says where each came from.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
@@ -75,19 +76,28 @@ def restore(
                 if info:
                     dir_times.append((target, info.mtime))
                 continue
-            src, gen = fs, None
+            src: RescueFS | PatchedFile = fs
+            view, gen, fp = fs, None, None
             if e.ftype == od.FT_SYMLINK:
                 cat, detail = fs.category(e), ""
             else:
                 if best:
                     gen = fs.best_version(node.tree, node.ino)[0]
-                    src = fs.view_at(gen)
-                cat, detail = src.file_check(node.tree, node.ino)
+                    src = view = fs.view_at(gen)
+                    fp = fs.file_patch(node.tree, node.ino) if patch else None
+                cat, detail = view.file_check(node.tree, node.ino)
                 if gen is not None:
                     detail = f"older version (generation {gen}); {detail}"
+                if fp is not None:
+                    src = fs.best_reader(e)
+                    detail = f"reconstructed: {fp.detail}"
+                    if fp.fills:
+                        detail += " [" + ", ".join(f"{a}-{b}@{g}" for a, b, g in fp.fills) + "]"
+            cat = cat or "?"
             stats.by_category[cat] = stats.by_category.get(cat, 0) + 1
             kind = "symlink" if e.ftype == od.FT_SYMLINK else "file"
-            if cat not in categories:
+            wanted = cat in categories or (fp is not None and fp.complete)
+            if not wanted:
                 stats.skipped_category += 1
                 rep.writerow([rel, kind, "", cat, "skipped", node.tree, node.ino, detail])
                 continue
@@ -109,14 +119,12 @@ def restore(
                 for chunk in src.iter_content(node.tree, node.ino, errors=errors):
                     out.write(chunk)
                     size += len(chunk)
-                if fill_older and cat == CAT_DAMAGED:
-                    fills = fill_from_older(src, node.tree, node.ino, out)
-                    if fills:
-                        stats.filled += 1
-                        detail += "; filled from older versions: " + ", ".join(
-                            f"{a}-{b}@{g}" for a, b, g in fills
-                        )
-            stats.older_versions += gen is not None
+            if fp is not None:
+                stats.patched += 1
+                if fp.complete:
+                    errors.clear()  # unreadable parts were replaced
+            else:
+                stats.older_versions += gen is not None
             info = src.inode(node.tree, node.ino)
             if info:
                 os.utime(target, (info.atime, info.mtime))
@@ -125,7 +133,8 @@ def restore(
                 detail = "; ".join([detail, *errors]).strip("; ")
             stats.files += 1
             stats.bytes += size
-            rep.writerow([rel, kind, size, cat, "written", node.tree, node.ino, detail])
+            action = "written" if fp is None else "reconstructed"
+            rep.writerow([rel, kind, size, cat, action, node.tree, node.ino, detail])
             if progress and stats.files % 200 == 0:
                 print(
                     f"\r  {stats.files} files, {stats.bytes / 2**20:.1f} MiB",
@@ -142,47 +151,3 @@ def restore(
     if progress and stats.files >= 200:
         print(file=sys.stderr)
     return stats, report_path
-
-
-def fill_from_older(fs: RescueFS, tree: int, ino: int, out) -> list[tuple[int, int, int]]:
-    """Overwrite bad ranges in `out` (the file as written from `fs`) with good data of older
-    versions, newest first. Returns [(start, end, generation)] of the ranges filled."""
-    todo = [(a, b) for a, b, kind in fs.problem_ranges(tree, ino) if kind == "bad"]
-    fills: list[tuple[int, int, int]] = []
-    for gen in fs.version_gens(tree, ino):
-        if not todo:
-            break
-        old = fs.view_at(gen)
-        size = old.layout(tree, ino).size
-        bad_old = [(a, b) for a, b, _k in old.problem_ranges(tree, ino)]
-        left = []
-        for a, b in todo:
-            for lo, hi in _subtract([(a, min(b, size))], bad_old):
-                if old._has_data(tree, ino, lo, hi):
-                    out.seek(lo)
-                    out.write(old.read(tree, ino, lo, hi - lo))
-                    fills.append((lo, hi, gen))
-            left += _subtract([(a, b)], [(lo, hi) for lo, hi, g in fills if g == gen])
-        todo = left
-    out.seek(0, os.SEEK_END)
-    return sorted(fills)
-
-
-def _subtract(ranges, cuts):
-    """Parts of `ranges` not covered by `cuts` (both lists of [start, end))."""
-    out = []
-    for a, b in ranges:
-        parts = [(a, b)]
-        for c, d in cuts:
-            nxt = []
-            for x, y in parts:
-                if d <= x or c >= y:
-                    nxt.append((x, y))
-                    continue
-                if x < c:
-                    nxt.append((x, c))
-                if d < y:
-                    nxt.append((d, y))
-            parts = nxt
-        out += [(x, y) for x, y in parts if y > x]
-    return out

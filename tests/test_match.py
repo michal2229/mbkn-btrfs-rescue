@@ -128,3 +128,61 @@ def test_chance_matches_are_not_used(tmp_path):
     pair[1000], pair[1001] = k0, k1  # confirmed layout, but the data there is different
     stats = match_copies(fs, pair, progress=False)
     assert stats["copied"] == 0 and stats["stale"] == 2
+
+
+def _damage_first_copy(img, fs, e) -> list[int]:
+    """Overwrite the first physical copy of every extent of a file (test image only)."""
+    rows = [r for _a, _b, r in fs.layout(e.node.tree, e.node.ino).segments if r.is_data]
+    with img.open("r+b") as fh:
+        for r in rows:
+            fh.seek(fs.map_logical(r.disk_bytenr)[0])
+            fh.write(random.Random(4).randbytes(r.disk_len))
+    return [len(fs.map_logical(r.disk_bytenr)) for r in rows]
+
+
+def test_dup_data_second_copy_is_used(tmp_path):
+    """DUP data: the first copy destroyed, the second one (same layout) recovers it."""
+    img, files = build_image(tmp_path, maker=_tree, extra=("-d", "dup"))
+    db = tmp_path / "index.sqlite"
+    base = ["-d", str(img), "--db", str(db)]
+    assert main([*base, "scan"]) == 0 and main([*base, "extract"]) == 0
+    fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
+    work = next(n for n in fs.children(ROOT) if n.startswith("_work@"))
+    e = fs.resolve(f"/{work}/alone.bin")[-1]  # no other copy of this file anywhere
+    assert set(_damage_first_copy(img, fs, e)) == {2}
+    assert main([*base, "classify"]) == 0
+    fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
+    assert fs.file_check(e.node.tree, e.node.ino)[0] == "intact"
+    want = files["_work/alone.bin"]
+    assert fs.read(e.node.tree, e.node.ino, 0, len(want) + 1) == want
+
+
+def test_compressed_copies_are_matched(tmp_path):
+    """Identical files compressed the same way have identical compressed sectors."""
+    img, files = build_image(tmp_path, "zstd", maker=_compressible_tree)
+    db = tmp_path / "index.sqlite"
+    base = ["-d", str(img), "--db", str(db)]
+    assert main([*base, "scan"]) == 0 and main([*base, "extract"]) == 0
+    fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
+    work = next(n for n in fs.children(ROOT) if n.startswith("_work@"))
+    e = fs.resolve(f"/{work}/a.log")[-1]
+    rows = [r for _a, _b, r in fs.layout(e.node.tree, e.node.ino).segments]
+    assert rows and all(r.comp == 3 and r.disk_len >= 2 * 4096 for r in rows)
+    _damage_first_copy(img, fs, e)
+    assert main([*base, "classify"]) == 0
+    fs = RescueFS(connect(db), Device(str(img)), exclude=EXCLUDE)
+    assert fs.file_check(e.node.tree, e.node.ino)[0] == "intact"
+    want = files["_work/a.log"]
+    assert fs.read(e.node.tree, e.node.ino, 0, len(want) + 1) == want
+
+
+def _compressible_tree(root: Path) -> dict[str, bytes]:
+    rng = random.Random(5)
+    words = [rng.randbytes(6).hex() for _ in range(3000)]
+    text = "\n".join(" ".join(rng.choice(words) for _ in range(12)) for _ in range(20000))
+    files = {"_work/a.log": text.encode(), "_work/copy/a.log": text.encode()}
+    for rel, data in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+    return files

@@ -19,7 +19,9 @@ zeros, or once classified: lost files); they stay listed in lost/. With a fixed 
 
 from __future__ import annotations
 
+import csv
 import errno
+import io
 import json
 import os
 import sqlite3
@@ -30,14 +32,26 @@ from collections import OrderedDict
 from collections.abc import Callable
 
 from .db import get_meta
-from .model import BEST_BIT, CAT_BITS, CAT_HELP, CAT_LOST, CATEGORIES, ROOT, Entry, RescueFS
+from .model import (
+    BEST_BIT,
+    CAT_BITS,
+    CAT_HELP,
+    CAT_LOST,
+    CATEGORIES,
+    ORPHANS_NAME,
+    PATCH_BIT,
+    ROOT,
+    Entry,
+    RescueFS,
+)
 
 try:
     import mfusepy as fuse
 except ImportError:  # pragma: no cover - optional extra
     fuse = None
 
-BEST, ALL, HISTORY, GEN_PREFIX, README = "best", "all", "history", "gen-", "README.txt"
+BEST, PATCHED, ALL, HISTORY, CURRENT = "best", "patched", "all", "history", "current"
+GEN_PREFIX, README, PATCHED_TSV = "gen-", "README.txt", "PATCHED.tsv"
 
 
 def _available() -> None:
@@ -79,22 +93,50 @@ def readme_text(fs: RescueFS | None, con: sqlite3.Connection) -> str:
     classified = fs.masks_valid()
     totals = fs.category_totals() if classified else {}
     older = fs.best_fallbacks() if classified else 0
-    best = f"{older:>8} files use an older version" if classified else "  (run classify)"
+    npatched = patched_count(con) if classified else 0
+    pending = "  (run classify)"
+
+    def row(name: str, count: str, text: str) -> str:
+        return f"  {name + '/':12} {count:29}   {text}"
+
     lines.append(
-        f"  {BEST + '/':12} {best}   START HERE: newest good version of every readable file"
+        row(
+            BEST,
+            f"{older:>8} older versions used" if classified else pending,
+            "START HERE: the most complete version of every file",
+        )
+    )
+    lines.append(
+        row(
+            PATCHED,
+            f"{npatched:>8} files" if classified else pending,
+            f"the files of best/ that are reconstructed (see {PATCHED_TSV})",
+        )
     )
     for cat in CATEGORIES:
         n, size = totals.get(cat, (0, 0))
-        count = f"{n:>8} files {size / 2**20:>10.1f} MiB" if classified else "  (run classify)"
-        lines.append(f"  {cat + '/':12} {count}   {CAT_HELP[cat]}")
+        count = f"{n:>8} files {size / 2**20:>10.1f} MiB" if classified else pending
+        lines.append(row(cat, count, CAT_HELP[cat]))
+    lines.append(row(ALL, "", "everything readable, newest known version of each file"))
+    lines.append(row(HISTORY, "", "everything readable up to a generation (older versions)"))
+    if get_meta(con, "current_built") is not None:
+        missing = int(get_meta(con, "current_missing", "0"))
+        lines.append(
+            row(CURRENT, "", "the disk as a normal mount shows it now")
+            + (f" ({missing} tree blocks unreadable: names missing)" if missing else "")
+        )
     lines += [
-        f"  {ALL + '/':12} {'':>30}   everything readable, newest known version of each file",
-        f"  {HISTORY + '/':12} {'':>30}   everything readable up to a generation (older versions)",
         "",
-        "best/ = newest version of each file, falling back to the newest older version with",
-        "better content when the latest is damaged or lost (intact > unverified > damaged).",
-        "Its files show the timestamps of the version served. Then check intact/, unverified/;",
-        "damaged/ files contain garbage in the bad parts.",
+        "best/ serves, for each file, the first of these that exists:",
+        "  1. verified content: the newest version that is intact (or unverified but",
+        "     plausible), falling back to older versions; bad sectors are already replaced by",
+        "     identical copies found elsewhere on the disk",
+        "  2. a git blob identical to the lost file (index / stash / HEAD)",
+        "  3. the best damaged version with all bad ranges filled from older versions",
+        "  4. a git blob of the same size, then 5. an older git blob of another size",
+        "  6. the best damaged version, partly filled, or as it is (garbage in the bad parts)",
+        f"Cases 2-6 are also listed in {PATCHED}/ and in {PATCHED_TSV} (source of each file):",
+        "check those before relying on them. Files show the timestamps of the version served.",
         "lost/ lists what existed, but its content could not be recovered.",
         *_copies_line(con),
         "all/ and history/ leave out files without recoverable data (zeros or lost).",
@@ -102,6 +144,34 @@ def readme_text(fs: RescueFS | None, con: sqlite3.Connection) -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def patched_count(con: sqlite3.Connection) -> int:
+    return con.execute("SELECT count(*) FROM file_patch").fetchone()[0]
+
+
+def patched_tsv(fs: RescueFS) -> str:
+    """One row per reconstructed file: path (as in best/), source, complete, detail."""
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter="\t", lineterminator="\n")
+    w.writerow(["path", "source", "complete", "detail"])
+    rows = []
+    for t, i, src, complete, detail in fs.con.execute(
+        "SELECT tree, ino, source, complete, detail FROM file_patch"
+    ):
+        rows.append([_path_in_mount(fs, t, i), src, "yes" if complete else "no", detail])
+    w.writerows(sorted(rows))
+    return buf.getvalue()
+
+
+def _path_in_mount(fs: RescueFS, tree: int, ino: int) -> str:
+    path = fs.path_of(tree, ino)
+    if path is not None:
+        return path
+    for e in fs.orphans(tree):  # directly in .orphans/ (named <inode>_<last name>)
+        if e.node.ino == ino:
+            return f"/{fs.tree_label(tree)}/{ORPHANS_NAME}/{e.name}"
+    return f"/{fs.tree_label(tree)}/{ORPHANS_NAME}/.../{ino}"
 
 
 def _copies_line(con: sqlite3.Connection) -> list[str]:
@@ -139,6 +209,8 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
         self._views: OrderedDict[int, RescueFS] = OrderedDict()
         self._gens: list[int] | None = None
         self._readme: bytes | None = None
+        self._patched_tsv: bytes | None = None
+        self._current: RescueFS | None = None
         self.mounted_at = time.time()
 
     # ------------------------------------------------------------------ live refresh
@@ -161,15 +233,19 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
         self._views.clear()
         self._gens = None
         self._readme = None
+        self._patched_tsv = None
+        self._current = None
 
     # ------------------------------------------------------------------ routing
 
     def _gen_list(self) -> list[int]:
+        assert self.fs is not None
         if self._gens is None:
             self._gens = self.fs.generations()
         return self._gens
 
     def _view(self, gen: int) -> RescueFS:
+        assert self.fs is not None
         if gen not in self._views:
             self._views[gen] = self.fs.at(gen)
             while len(self._views) > 16:
@@ -179,8 +255,16 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
 
     def _readme_bytes(self) -> bytes:
         if self._readme is None:
-            self._readme = readme_text(self.fs, self._con).encode()
+            self._readme = readme_text(self.fs, self._con).encode() if self._con else b""
         return self._readme
+
+    def _patched_bytes(self) -> bytes:
+        if self._patched_tsv is None:
+            self._patched_tsv = patched_tsv(self.fs).encode() if self.fs else b""
+        return self._patched_tsv
+
+    def _virtual_file(self, name: str) -> bytes:
+        return self._readme_bytes() if name == README else self._patched_bytes()
 
     def _route(self, path: str):
         """-> ("virtual", [names]) | ("readme", None) | ("fs", (view, subpath, category|None))"""
@@ -190,18 +274,23 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
             if not parts:
                 return "virtual", [README]
             if parts == [README]:
-                return "readme", None
+                return "readme", README
             raise _enoent()
         if not self.layered:
             return "fs", (self.fs, path, None)
         if not parts:
-            return "virtual", [README, BEST, *CATEGORIES, ALL, HISTORY]
+            names = [README, PATCHED_TSV, BEST, PATCHED, *CATEGORIES, ALL, HISTORY]
+            return "virtual", [*names, CURRENT] if self._has_current() else names
         head, rest = parts[0], "/" + "/".join(parts[1:])
-        if head == README and len(parts) == 1:
-            return "readme", None
+        if head in (README, PATCHED_TSV) and len(parts) == 1:
+            return "readme", head
         if head == ALL:
             return "fs", (self.fs, rest, None)
-        if head in CAT_BITS or head == BEST:
+        if head == CURRENT and self._has_current():
+            if self._current is None:
+                self._current = self.fs.current_view()
+            return "fs", (self._current, rest, CURRENT)
+        if head in CAT_BITS or head in (BEST, PATCHED):
             return "fs", (self.fs, rest, head)
         if head == HISTORY:
             if len(parts) == 1:
@@ -213,16 +302,21 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
                     return "fs", (self._view(gen), "/" + "/".join(parts[2:]), None)
         raise _enoent()
 
+    def _has_current(self) -> bool:
+        return self._con is not None and get_meta(self._con, "current_built") is not None
+
     def _visible(self, fs: RescueFS, e: Entry, cat: str | None) -> bool:
+        if cat == CURRENT:
+            return True  # as mounted: every current name, readable or not
         if e.stale:
             return False
         if cat is not None:
-            bit = BEST_BIT if cat == BEST else CAT_BITS[cat]
+            bit = BEST_BIT if cat == BEST else PATCH_BIT if cat == PATCHED else CAT_BITS[cat]
             return fs.masks_valid() and bool(fs.entry_mask(e) & bit)
         if self.show_unreadable:
             return True
         if fs.at_gen is None and fs.masks_valid():  # classified: hide lost files and dirs
-            m = fs.entry_mask(e) & ~BEST_BIT
+            m = fs.entry_mask(e) & ~(BEST_BIT | PATCH_BIT)
             return m == 0 or bool(m & ~CAT_BITS[CAT_LOST])
         return fs.has_content(e)
 
@@ -236,8 +330,8 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
         return chain
 
     @staticmethod
-    def _file_view(fs: RescueFS, e: Entry, cat: str | None) -> RescueFS:
-        return fs.best_entry_view(e) if cat == BEST else fs
+    def _file_view(fs: RescueFS, e: Entry, cat: str | None):
+        return fs.best_reader(e) if cat in (BEST, PATCHED) else fs
 
     def _dir_attr(self) -> dict:
         t = self.mounted_at
@@ -262,7 +356,7 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
                 return self._dir_attr() | {
                     "st_mode": stat_mod.S_IFREG | 0o444,
                     "st_nlink": 1,
-                    "st_size": len(self._readme_bytes()),
+                    "st_size": len(self._virtual_file(arg)),
                 }
             fs, sub, cat = arg
             chain = self._resolve(fs, sub, cat)
@@ -304,7 +398,7 @@ class RescueOps(fuse.Operations if fuse else object):  # type: ignore[misc]
         with self._mutex:
             kind, arg = self._route(path)
             if kind == "readme":
-                return self._readme_bytes()[offset : offset + size]
+                return self._virtual_file(arg)[offset : offset + size]
             if kind != "fs":
                 raise fuse.FuseOSError(errno.EISDIR)
             fs, sub, cat = arg

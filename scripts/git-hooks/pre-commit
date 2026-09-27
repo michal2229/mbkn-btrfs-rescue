@@ -1,0 +1,3 @@
+#!/bin/sh
+# Static checks before every commit (a few seconds). Enabled by scripts/setup.sh.
+exec "$(git rev-parse --show-toplevel)/scripts/checks.sh"

@@ -30,7 +30,7 @@ CAT_MARK = {"intact": "✓", "unverified": "?", "damaged": "!", "lost": "✗"}
 TYPE_CHAR = {od.FT_DIR: "d", od.FT_SYMLINK: "l", od.FT_REG: "-"}
 
 
-def fmt_size(n: int) -> str:
+def fmt_size(n: float) -> str:
     for unit in ("B", "K", "M", "G", "T"):
         if n < 1024 or unit == "T":
             return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
@@ -52,6 +52,7 @@ class Shell(cmd.Cmd):
 
     def __init__(self, fs: RescueFS, start: tuple[Entry, ...] = ()):
         super().__init__()
+        self.base = fs.at(None) if fs.at_gen is not None else fs  # latest view
         self.fs = fs
         self.cwd: tuple[Entry, ...] = start
         self._update_prompt()
@@ -165,10 +166,10 @@ class Shell(cmd.Cmd):
         if not self.fs.masks_valid():
             return " "
         if not e.is_dir:
-            return CAT_MARK.get(self.fs.category(e), " ")
+            return CAT_MARK.get(self.fs.category(e) or "", " ")
         mask = self.fs.entry_mask(e)
         best = next((c for c in CATEGORIES if mask & CAT_BITS[c]), None)
-        return CAT_MARK.get(best, " ")
+        return CAT_MARK.get(best or "", " ")
 
     def _print_entries(self, entries: list[Entry], long: bool) -> None:
         for e in entries:
@@ -290,6 +291,9 @@ class Shell(cmd.Cmd):
             gen, best_cat = self.fs.best_version(t, ino)
             if gen is not None:
                 print(f"best     older version at generation {gen} is {best_cat} (see best/)")
+            patch = self.fs.file_patch(t, ino)
+            if patch is not None:
+                print(f"best/    reconstructed - {patch.detail} (see patched/, PATCHED.tsv)")
 
     def do_versions(self, line: str) -> None:
         """versions PATH - generations of the inode seen on disk (use with `gen N`)"""
@@ -336,13 +340,18 @@ class Shell(cmd.Cmd):
     # ------------------------------------------------------------------ actions
 
     def do_restore(self, line: str) -> None:
-        """restore PATH DEST [--overwrite] [--damaged] [--lost] [--latest] - copy to DEST
+        """restore PATH DEST [--overwrite] [--damaged] [--lost] [--latest] [--no-patch]
 
-        Writes intact and unverified files, each in its best version (an older one when the
-        newest is broken); --damaged / --lost include those too, --latest keeps newest."""
+        Writes what best/ shows for intact, unverified and fully reconstructed files (older
+        versions where the newest broke, content filled from older versions or git);
+        --damaged / --lost include those too, --latest keeps the newest version, --no-patch
+        writes files' own content instead of reconstructions."""
         args = self._args(line)
         if not args or len([a for a in args if not a.startswith("--")]) != 2:
-            print("usage: restore PATH DEST [--overwrite] [--damaged] [--lost] [--latest]")
+            print(
+                "usage: restore PATH DEST [--overwrite] [--damaged] [--lost] [--latest] "
+                "[--no-patch]"
+            )
             return
         src, dst = [a for a in args if not a.startswith("--")]
         chain = self._resolve(src)
@@ -359,10 +368,11 @@ class Shell(cmd.Cmd):
             categories=frozenset(cats),
             overwrite="--overwrite" in args,
             best="--latest" not in args,
+            patch="--no-patch" not in args,
         )
         print(
             f"wrote {stats.files} files ({fmt_size(stats.bytes)}), {stats.links} symlinks "
-            f"({stats.older_versions} older versions); "
+            f"({stats.older_versions} older versions, {stats.patched} reconstructed); "
             f"skipped {stats.skipped_category} by category, {stats.skipped} existing"
         )
         print(f"categories seen: {stats.by_category}\nreport: {report}")
@@ -389,19 +399,24 @@ class Shell(cmd.Cmd):
         if not arg:
             print(f"at_gen = {self.fs.at_gen}")
             return
-        self.fs.at_gen = None if arg in ("off", "none", "latest") else int(arg)
-        self.fs._layouts.clear()
+        gen = None if arg in ("off", "none", "latest") else int(arg)
+        self.fs = self.base if gen is None else self.base.at(gen)  # fresh listings and layouts
         self._update_prompt()
 
     def do_exclude(self, line: str) -> None:
         """exclude [NAME ...] | exclude -NAME - show / add / remove hidden names"""
+        exclude = set(self.base.exclude)
         for arg in line.split():
             if arg.startswith("-"):
-                self.fs.exclude.discard(arg[1:])
+                exclude.discard(arg[1:])
             else:
-                self.fs.exclude.add(arg)
-        self.fs._orphans.clear()
-        print("excluded:", ", ".join(sorted(self.fs.exclude)) or "(none)")
+                exclude.add(arg)
+        if exclude != self.base.exclude:  # a view with the new names (listings recomputed)
+            self.base = self.base.at(None)
+            self.base.exclude = exclude
+            self.base._orphans = {}
+            self.fs = self.base if self.fs.at_gen is None else self.base.at(self.fs.at_gen)
+        print("excluded:", ", ".join(sorted(exclude)) or "(none)")
 
     def do_quit(self, _line: str) -> bool:
         """quit - leave the shell"""

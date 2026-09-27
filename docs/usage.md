@@ -67,10 +67,13 @@ Reads every data extent once, in physical order (disk speed), compares every sec
 checksum tree, and stores the result per sector. Files are then categorised by the sectors
 they actually use, and the best version of each damaged/lost file is looked up (see
 [how-it-works.md](how-it-works.md#categories)). Resumable; running it again only re-checks
-what is new, then recomputes the categories (seconds to a minute). After upgrading the tool,
-`classify` re-checks exactly the extents whose rules changed and migrates the index.
+what is new. After upgrading the tool, `classify` re-checks exactly the extents whose rules
+changed and migrates the index.
 
-`classify` then runs `match` (below) unless `--no-match`.
+After checking, `classify` also runs `match` (below; `--no-match` to skip), builds the
+current state for `current/`, categorises every file and chooses reconstructions for damaged
+and lost files (`--no-patch` to skip; see [best/](#fuse-mount-recommended)). On a 500 GB disk
+the steps after checking take about 5 minutes; the first `match` adds the one-time hashing.
 
 ## 3c. Match: bad sectors from identical copies (pass 4)
 
@@ -85,8 +88,9 @@ is confirmed by its neighbour (see [how-it-works.md](how-it-works.md#copies)); s
 expected checksum is that of zeros come back as zeros. Then categories are recomputed. Runs
 automatically in `classify`, `analyze` and `mount`; takes a few minutes on a 500 GB disk.
 
-**Shortcut:** `uv run mbkn-btrfs-rescue analyze` runs scan → extract → classify → match,
-resumable, extracting leaves incrementally while scanning (`--no-match` to skip the last).
+**Shortcut:** `uv run mbkn-btrfs-rescue analyze` runs everything - scan → extract → classify
+(with match, current state, reconstructions) - resumable, extracting leaves incrementally
+while scanning. `--no-match` and `--no-patch` skip those steps.
 
 ## 4. Browse
 
@@ -114,7 +118,7 @@ uv run mbkn-btrfs-rescue shell            # or: shell /_work@257/myproject
 ### FUSE mount (recommended)
 
 ```
-uv run mbkn-btrfs-rescue mount ~/rescue          # Ctrl-C (or fusermount3 -u) to unmount
+uv run mbkn-btrfs-rescue mount ~/rescue          # Ctrl-C, or `mbkn-btrfs-rescue umount`
 ```
 
 If the index is incomplete, `mount` starts the full analysis (`analyze`) in the background
@@ -122,18 +126,22 @@ and the mounted tree refreshes itself (default every 30 s, `--refresh`); progres
 `README.txt` at the mount root. The analysis log goes to `<tmp_dir>/analyze.log`.
 Unmounting pauses the analysis; mounting again resumes it. When the stored categories were
 made by an older version of the tool or with another exclude list (`-x`, `--no-exclude`),
-`mount` re-runs classification in the background the same way (usually well under a minute).
+`mount` re-runs classification in the background the same way (a few minutes on 500 GB; the
+folders keep working meanwhile).
 
 ```
 ~/rescue/
   README.txt                              categories explained, counts, live progress
-  best/<subvol>@<id>/...                  newest good version of each file  <- start here
+  PATCHED.tsv                             source of every reconstructed file in best/
+  best/<subvol>@<id>/...                  most complete version of each file  <- start here
+  patched/<subvol>@<id>/...               the files of best/ that are reconstructed
   intact/<subvol>@<id>/...                verified content (or inline in metadata)
   unverified/<subvol>@<id>/...            no checksum on record - probably fine, check
   damaged/<subvol>@<id>/...               some sectors bad - partially readable
   lost/<subvol>@<id>/...                  content gone - names, sizes, dates only
   all/<subvol>@<id>/...                   everything readable, newest version of each file
   history/gen-0001100/<subvol>@<id>/...   everything readable as seen up to generation 1100
+  current/...                             the disk as mounted now (top level, subvolumes in place)
 ```
 
 `best/` shows each file's newest version, except when an older version (up to 64 back) is
@@ -141,7 +149,20 @@ strictly better: a better category (intact > unverified > damaged > lost), fewer
 among damaged versions, or real content when the newest version is empty (files truncated when
 disaster struck). Then it serves the newest such older version, with that version's size and
 timestamps. `README.txt` says how many files use an older version; `stat` in the shell shows it
-per file. Only files with nothing readable in any version are missing from `best/`.
+per file.
+
+For files whose best version is still damaged or lost, `best/` serves a **reconstruction**
+when there is one: bad ranges filled with good data of older versions, or the file's content
+from its git repository (index, stash, HEAD - see section 7), in the order given in the README.
+These files are also listed in `patched/` (same paths) and in `PATCHED.tsv` at the mount root
+(path, source, complete, detail). Only files with nothing readable anywhere are missing from
+`best/`. `classify --no-patch` turns reconstructions off.
+
+`current/` shows the filesystem as a normal mount of the device would now: the top-level
+subvolume as root, nested subvolumes where they are mounted, only names that exist in the
+newest trees (no deleted files, no old names), newest content - unreadable files included, as
+the kernel would show them. It is built from the latest root items (see
+[how-it-works.md](how-it-works.md#current-state)).
 
 Nested subvolumes appear once, at the top level (`<name>@<id>`), not also inside their parent
 directory - otherwise every file in them would show up twice.
@@ -189,10 +210,10 @@ and, for older versions, the generation used.
 Copying from the mount's `best/` gives the same bytes; see the README for when to prefer
 which.
 
-`--fill-older` also writes damaged files and fills their bad ranges with good data from older
-versions (newest first). That content can be older than the rest of the file - useful for text
-and code, where an older paragraph beats garbage; the report lists every filled range as
-`start-end@generation`.
+Reconstructed files (see `best/` above) are written too: complete ones by default, partly filled
+ones with `--include damaged`. The report marks them `reconstructed`, with their source and
+every filled range as `start-end@generation`. `--no-patch` writes the files' own content
+instead.
 
 ## 6. Review list
 
@@ -214,6 +235,9 @@ uv run mbkn-btrfs-rescue git-rescue /_work@257                       # report on
 uv run mbkn-btrfs-rescue git-rescue /_work@257 --dest ~/recovered-git  # also write files
 ```
 
+`best/` and `restore` already use this automatically; `git-rescue` gives the full report
+(including files git cannot help with: `not tracked`, `object lost`) and can export the blobs.
+
 For each git work tree with lost or damaged files, the readable part of its `.git` is restored
 to a scratch directory under `tmp_dir`, and the blobs recorded for each such file are read with
 `git`: from the **index** (staged), the latest **stash**, and **HEAD**. Each blob is compared
@@ -224,6 +248,30 @@ written to `DEST/<subvol>@<id>/path` (never overwriting); report
 anything: its config is replaced by a minimal one and hooks are not restored.
 
 Restore to a **different disk** than the one being recovered.
+
+## 8. Housekeeping
+
+```
+uv run mbkn-btrfs-rescue status        # mounts, running commands, progress, device, disk usage
+uv run mbkn-btrfs-rescue umount        # unmount all of this tool's mounts (or name one)
+uv run mbkn-btrfs-rescue stop          # unmount everything, pause running analyses
+uv run mbkn-btrfs-rescue clean         # show what can be removed; --yes to delete
+```
+
+`status` lists this tool's FUSE mounts and running commands (only the tool itself - an editor
+opened on the project directory never matches), the analysis state, whether the device is
+readable and read-only at the block layer, and the size of the index, the sector-hash cache
+and `tmp_dir`. Sizes never include what is mounted.
+
+`umount` fails when something still uses the mount (a shell `cd`'ed into it, a file manager);
+close it, or `--lazy` detaches at once and finishes when it is no longer used. `stop`
+interrupts running `analyze`/`classify`/`match` commands with Ctrl-C semantics: they resume
+where they stopped on the next run (`--force` sends SIGTERM).
+
+`clean` removes only what the tool creates and can recreate: test images, scratch directories
+of interrupted git steps, logs, unfinished hash files; `--hashes` adds the sector-hash cache
+(rebuilding it takes minutes). The index and anything else in `tmp_dir` (restored files) are
+listed as kept and never touched; nothing with a mount inside is deleted.
 
 ## Typical session for "recover my code, skip virtualenvs"
 

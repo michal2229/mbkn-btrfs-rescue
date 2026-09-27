@@ -18,7 +18,7 @@ CSUM_NAMES = {
 }
 
 
-def csum_function(csum_type: int) -> Callable[[bytes], bytes]:
+def csum_function(csum_type: int) -> Callable[[bytes | memoryview], bytes]:
     """Return f(data) -> raw checksum bytes as stored on disk (not padded)."""
     match csum_type:
         case 0:

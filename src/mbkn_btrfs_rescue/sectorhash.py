@@ -42,6 +42,7 @@ def _hash_chunk(path: str, offset: int, length: int, sectorsize: int, csum_type:
     dev = Device(path)
     try:
         data = dev.pread(length, offset)
+        dev.drop_cache(offset, length)  # read once: do not push everything else out of RAM
     finally:
         dev.close()
     n = len(data) // sectorsize
@@ -76,14 +77,14 @@ class SectorHashes:
             return
         nchunks = -(-self.nsect * self.sectorsize // CHUNK)
         dtype = key_dtype(self.csum_type)
+        keys: np.memmap | None = None
+        done: np.ndarray | None = None
         if self.path.exists() and self._done_path.exists():
             keys = np.lib.format.open_memmap(self.path, mode="r+")
             done = np.load(self._done_path)
             if keys.shape != (self.nsect,) or keys.dtype != dtype or done.shape != (nchunks,):
                 keys, done = None, None
-        else:
-            keys, done = None, None
-        if keys is None:
+        if keys is None or done is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             keys = np.lib.format.open_memmap(self.path, mode="w+", dtype=dtype, shape=(self.nsect,))
             done = np.zeros(nchunks, dtype=bool)

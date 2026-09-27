@@ -67,7 +67,7 @@ def review(
     if header:
         w.writerow(
             ["path", "category", "size", "bad_bytes", "unverified_bytes", "version",
-             "bad_ranges", "unverified_ranges", "detail"]
+             "bad_ranges", "unverified_ranges", "detail", "best_serves"]
         )  # fmt: skip
     counts: dict[str, int] = {}
     for path, e in _files(fs, entry, rel, bits):
@@ -80,9 +80,11 @@ def review(
         ranges = src.problem_ranges(t, i)
         nbad = sum(b - a for a, b, k in ranges if k == "bad")
         nunv = sum(b - a for a, b, k in ranges if k == "unverified")
+        patch = fs.file_patch(t, i) if best else None
+        serves = f"reconstruction: {patch.detail}" if patch else "this version"
         w.writerow(
             [path, cat, src.layout(t, i).size, nbad, nunv, "latest" if gen is None else gen,
-             fmt_ranges(ranges, "bad"), fmt_ranges(ranges, "unverified"), detail]
+             fmt_ranges(ranges, "bad"), fmt_ranges(ranges, "unverified"), detail, serves]
         )  # fmt: skip
         counts[cat] = counts.get(cat, 0) + 1
     out.flush()

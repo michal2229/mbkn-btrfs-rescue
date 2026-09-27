@@ -15,8 +15,8 @@ to `./mbkn-btrfs-rescue.toml` (gitignored — it is machine specific).
 | key | default | |
 |---|---|---|
 | `device` | — | device or image file; only ever opened read-only |
-| `tmp_dir` | `~/.tmp/mbkn-btrfs-rescue` | scratch space (test images, Python `tempfile`) |
-| `cache_dir` | `~/.cache/mbkn-btrfs-rescue` | the SQLite index lives here |
+| `tmp_dir` | `~/.tmp/mbkn-btrfs-rescue` | scratch space (test images, git scratch copies, logs, Python `tempfile`) |
+| `cache_dir` | `~/.cache/mbkn-btrfs-rescue` | the SQLite index and the sector-hash cache (4 bytes per device sector) live here |
 | `db_name` | `index.sqlite` | index file name inside `cache_dir` |
 | `exclude` | `[".venv", ".venv-tools"]` | names hidden from browse / mount / restore |
 
@@ -24,5 +24,7 @@ to `./mbkn-btrfs-rescue.toml` (gitignored — it is machine specific).
 `--no-exclude`) override the file.
 
 Nothing secret is stored anywhere; the index contains file names and metadata from the
-recovered filesystem, so treat `cache_dir` with the same care as the disk itself and delete it
-when done.
+recovered filesystem (and the content of files reconstructed from git), so treat `cache_dir`
+with the same care as the disk itself and delete it when done. `mbkn-btrfs-rescue clean`
+removes the scratch files; `clean --hashes` also the sector-hash cache; the index is removed by
+hand (`status` shows where it is).

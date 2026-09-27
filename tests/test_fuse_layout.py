@@ -12,7 +12,18 @@ from mbkn_btrfs_rescue.model import RescueFS
 fusefs = pytest.importorskip("mbkn_btrfs_rescue.fusefs")
 pytest.importorskip("mfusepy")
 
-ROOT_NAMES = ["README.txt", "best", "intact", "unverified", "damaged", "lost", "all", "history"]
+ROOT_NAMES = [
+    "README.txt",
+    "PATCHED.tsv",
+    "best",
+    "patched",
+    "intact",
+    "unverified",
+    "damaged",
+    "lost",
+    "all",
+    "history",
+]
 
 
 def _ops(img, db, **kw):
@@ -135,7 +146,7 @@ def test_best_falls_back_to_older_good_version(tmp_path, indexed):
     path = f"/best/{work}/proj/main.py"
     want = files["_work/proj/main.py"]
     assert ops.read(path, 1 << 20, 0, 0)[: len(want)] == want
-    assert "1 files use an older version" in ops.read("/README.txt", 10000, 0, 0).decode()
+    assert "1 older versions used" in ops.read("/README.txt", 10000, 0, 0).decode()
 
 
 def test_outdated_classification_is_detected(indexed):
@@ -151,3 +162,79 @@ def test_outdated_classification_is_detected(indexed):
     con.execute("UPDATE meta SET value='1' WHERE key='check_version'")
     con.commit()
     assert classification_outdated(con, exclude)  # rules changed since
+
+
+def test_current_shows_the_disk_as_mounted(indexed):
+    """current/: top-level subvolume as root, _work mounted in place, only current names."""
+    import stat as stat_mod
+
+    _tmp, img, db, files, base = indexed
+    ops = _ops(img, db)
+    assert "current" not in ops.readdir("/", None)  # not built before classify
+    con = connect(db)
+    tree = con.execute("SELECT DISTINCT tree FROM dirents WHERE name=?", (b"proj",)).fetchone()[0]
+    proj = con.execute("SELECT child FROM dirents WHERE name=?", (b"proj",)).fetchone()[0]
+    con.execute(  # a name seen only in an old generation (a deleted file)
+        "INSERT INTO dirents VALUES (?,?,?,?,1,1,1,1)", (tree, proj, b"deleted.txt", 999999)
+    )
+    con.commit()
+    assert main([*base, "classify"]) == 0
+    ops = _ops(img, db)
+    assert ops.readdir("/", None)[-1] == "current"
+    walked, stack = {}, ["/current"]
+    while stack:
+        d = stack.pop()
+        for name in ops.readdir(d, None)[2:]:
+            p = f"{d}/{name}"
+            st = ops.getattr(p)
+            if stat_mod.S_ISDIR(st["st_mode"]):
+                stack.append(p)
+            elif stat_mod.S_ISREG(st["st_mode"]):
+                walked[p.removeprefix("/current/")] = ops.read(p, st["st_size"] + 1, 0, 0)
+    want = {k: v for k, v in files.items() if ".venv" not in k}
+    assert walked == want
+    assert ops.readlink("/current/_work/proj/link") == "main.py"
+    merged = _ops(img, db, show_unreadable=True)
+    work = next(n for n in merged.readdir("/all", None) if n.startswith("_work@"))
+    assert "deleted.txt" in merged.readdir(f"/all/{work}/proj", None)  # merged: every name
+    assert "deleted.txt" not in ops.readdir("/current/_work/proj", None)
+
+
+def test_current_without_a_superblock_falls_back_to_the_index(indexed):
+    """After a new mkfs the old filesystem has no superblock: the index still finds its trees."""
+    from mbkn_btrfs_rescue.current import build_current
+
+    _tmp, img, db, _files, _base = indexed
+    fs = RescueFS(connect(db), Device(str(img)))
+    with_sb = build_current(fs, progress=False)
+    names = sorted(fs.con.execute("SELECT tree, dir, name FROM current_dirent"))
+    fs.dev.superblocks = lambda: []  # as if overwritten
+    without = build_current(fs, progress=False)
+    assert with_sb["from_superblock"] == 1 and without["from_superblock"] == 0
+    assert sorted(fs.con.execute("SELECT tree, dir, name FROM current_dirent")) == names
+    assert with_sb["missing"] == without["missing"] == 0
+
+
+def test_current_mounts_nested_subvolumes_in_place(tmp_path):
+    """current/_work/nested/ is the nested subvolume; merged views list it once, top level."""
+    from .conftest import build_image, make_tree
+
+    def tree(root):
+        files = make_tree(root)
+        (root / "_work/nested").mkdir()
+        (root / "_work/nested/inner.txt").write_bytes(b"in a nested subvolume\n")
+        return files | {"_work/nested/inner.txt": b"in a nested subvolume\n"}
+
+    img, _files = build_image(tmp_path, maker=tree, extra=("-u", "rw:_work/nested"))
+    db = tmp_path / "index.sqlite"
+    base = ["-d", str(img), "--db", str(db)]
+    assert main([*base, "scan"]) == 0 and main([*base, "extract"]) == 0
+    assert main([*base, "classify"]) == 0
+    ops = _ops(img, db)
+    assert "nested" in ops.readdir("/current/_work", None)
+    p = "/current/_work/nested/inner.txt"
+    assert ops.read(p, 100, 0, 0) == b"in a nested subvolume\n"
+    top = ops.readdir("/all", None)
+    assert any(n.startswith("nested@") for n in top)
+    work = next(n for n in top if n.startswith("_work@"))
+    assert "nested" not in ops.readdir(f"/all/{work}", None)  # not twice

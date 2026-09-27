@@ -32,7 +32,7 @@ def test_mount_serves_files_through_the_kernel(indexed, tmp_path):
                 pytest.fail(proc.stdout.read().decode())
             time.sleep(0.1)
         assert os.path.ismount(mnt)
-        assert sorted(os.listdir(mnt))[:3] == ["README.txt", "all", "best"]
+        assert {"README.txt", "PATCHED.tsv", "all", "best", "patched"} <= set(os.listdir(mnt))
         work = next(n for n in os.listdir(mnt / "best") if n.startswith("_work@"))
         want = files["_work/proj/pkg/big.txt"]
         for folder in ("best", "intact", "all"):
@@ -43,6 +43,15 @@ def test_mount_serves_files_through_the_kernel(indexed, tmp_path):
         assert ".venv" not in os.listdir(mnt / "all" / work)
         with pytest.raises(OSError):
             (mnt / "all" / work / "new.txt").write_bytes(b"x")  # read-only
+        # housekeeping tools see the mount and its process, and never read through it
+        from mbkn_btrfs_rescue.tools import local_size, our_mounts, our_processes
+
+        assert str(mnt) in our_mounts()
+        assert any(p.pid == proc.pid and p.command.startswith("mount") for p in our_processes())
+        assert local_size(mnt) == 0
+        assert main(["umount", str(mnt)]) == 0
+        proc.wait(timeout=10)
+        assert not os.path.ismount(mnt)
     finally:
-        subprocess.run(["fusermount3", "-u", str(mnt)], check=False)
+        subprocess.run(["fusermount3", "-u", str(mnt)], check=False, capture_output=True)
         proc.wait(timeout=10)

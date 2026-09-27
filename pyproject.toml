@@ -1,6 +1,6 @@
 [project]
 name = "mbkn-btrfs-rescue"
-version = "0.3.0"
+version = "0.4.0"
 description = "Read-only btrfs recovery: scan a device for tree blocks, index them in SQLite, browse and restore files"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -19,8 +19,11 @@ mbkn-btrfs-rescue = "mbkn_btrfs_rescue.cli:main"
 
 [dependency-groups]
 dev = [
+    "codespell>=2.4.3",
+    "mypy>=2.3.1",
     "pytest>=8.3",
     "ruff>=0.12",
+    "shellcheck-py>=0.11.0.1",
 ]
 
 [build-system]
@@ -41,3 +44,14 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.mypy]
+python_version = "3.14"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+
+[tool.codespell]
+skip = "*.lock,*.sqlite,*.npy,.git,.venv"
+ignore-words-list = "ot,fo"
