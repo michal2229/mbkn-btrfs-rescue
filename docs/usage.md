@@ -1,0 +1,186 @@
+# Usage
+
+All commands accept the global options `-c/--config`, `-d/--device` and `--db` **before** the
+command name. Defaults come from the config file (see [configuration.md](configuration.md)).
+
+```
+uv run mbkn-btrfs-rescue [-c CONFIG] [-d DEVICE] [--db INDEX] COMMAND ...
+```
+
+## 0. Protect the device
+
+Stop using the filesystem. Do **not** mount it (not even read-only — the kernel may replay a
+log tree), do not run `btrfs check --repair`, `btrfs rescue`, or any tool that writes.
+
+```
+scripts/device-access.sh grant /dev/mapper/luks-...   # blockdev --setro + read ACL for you
+scripts/device-access.sh status
+```
+
+The ACL and read-only flag vanish on reboot or when the LUKS mapping is closed.
+
+## 1. Look at the superblocks
+
+```
+uv run mbkn-btrfs-rescue info
+```
+
+Shows label, fsid, generation, usage and the four backup roots. A very low generation
+(single digits) on a disk that held data means it was re-created with `mkfs`.
+
+## 2. Scan (pass 1)
+
+```
+uv run mbkn-btrfs-rescue scan                 # whole device
+uv run mbkn-btrfs-rescue scan --resume        # continue after Ctrl-C
+uv run mbkn-btrfs-rescue scan --start 100G --end 200G --force   # partial / fresh
+```
+
+Reads ahead in a background thread while parsing, so it runs close to disk speed (about
+1.2 GiB/s on an NVMe behind LUKS that reads 1.6 GB/s raw; ~13 min for 500 GB at the old rate,
+~7 now). At the end, and at any time via `fsids`, it prints the filesystem UUIDs found with the
+number of valid blocks and generation ranges.
+
+```
+uv run mbkn-btrfs-rescue fsids
+uv run mbkn-btrfs-rescue trees     # blocks per tree id; subvolume names after extract
+```
+
+## 3. Extract (pass 2)
+
+```
+uv run mbkn-btrfs-rescue extract                       # fsid with most blocks, all fs trees
+uv run mbkn-btrfs-rescue extract --fsid <uuid>         # an older (overwritten) filesystem
+uv run mbkn-btrfs-rescue extract --trees 5,257         # only some subvolumes (faster)
+uv run mbkn-btrfs-rescue extract --allow-bad-csum      # desperate mode
+uv run mbkn-btrfs-rescue subvols
+```
+
+## 3b. Classify (pass 3)
+
+```
+uv run mbkn-btrfs-rescue classify              # verify every data extent, categorise files
+uv run mbkn-btrfs-rescue classify --quick      # sample 3 sectors per extent (fast estimate)
+```
+
+Reads every data extent once, in physical order (disk speed), compares every sector with the
+checksum tree, and stores the result per sector. Files are then categorised by the sectors
+they actually use, and the best version of each damaged/lost file is looked up (see
+[how-it-works.md](how-it-works.md#categories)). Resumable; running it again only re-checks
+what is new, then recomputes the categories (seconds to a minute). After upgrading the tool,
+`classify` re-checks exactly the extents whose rules changed and migrates the index.
+
+**Shortcut:** `uv run mbkn-btrfs-rescue analyze` runs scan → extract → classify, resumable,
+extracting leaves incrementally while scanning.
+
+## 4. Browse
+
+### Shell
+
+```
+uv run mbkn-btrfs-rescue shell            # or: shell /_work@257/myproject
+```
+
+| command | |
+|---|---|
+| `ls [-l] [-a] [PATH]` | list with category markers `✓ ? ! ✗`; `-a` also shows lost and stale entries |
+| `summary [PATH]` | files and bytes per category below PATH |
+| `cd PATH`, `pwd` | navigate (tab completion works) |
+| `tree [PATH] [DEPTH]` | recursive listing |
+| `find GLOB [PATH]` | e.g. `find '*.py' /_work@257` |
+| `grep REGEX [PATH]` | search file contents (files < 4 MiB) |
+| `stat PATH` | inode, extents, compression, per-extent verification, category, best version |
+| `versions PATH` | generations this inode was seen in |
+| `gen N` / `gen off` | view everything as of generation N (older versions) |
+| `cat PATH`, `less PATH` | show content |
+| `restore PATH DEST [--damaged] [--lost] [--latest] [--overwrite]` | copy the best version of intact + unverified files (plus opted-in categories) to DEST |
+| `exclude [NAME]`, `exclude -NAME` | show / add / remove hidden names |
+
+### FUSE mount (recommended)
+
+```
+uv run mbkn-btrfs-rescue mount ~/rescue          # Ctrl-C (or fusermount3 -u) to unmount
+```
+
+If the index is incomplete, `mount` starts the full analysis (`analyze`) in the background
+and the mounted tree refreshes itself (default every 30 s, `--refresh`); progress is shown in
+`README.txt` at the mount root. The analysis log goes to `<tmp_dir>/analyze.log`.
+Unmounting pauses the analysis; mounting again resumes it. When the stored categories were
+made by an older version of the tool or with another exclude list (`-x`, `--no-exclude`),
+`mount` re-runs classification in the background the same way (usually well under a minute).
+
+```
+~/rescue/
+  README.txt                              categories explained, counts, live progress
+  best/<subvol>@<id>/...                  newest good version of each file  <- start here
+  intact/<subvol>@<id>/...                verified content (or inline in metadata)
+  unverified/<subvol>@<id>/...            no checksum on record - probably fine, check
+  damaged/<subvol>@<id>/...               some sectors bad - partially readable
+  lost/<subvol>@<id>/...                  content gone - names, sizes, dates only
+  all/<subvol>@<id>/...                   everything readable, newest version of each file
+  history/gen-0001100/<subvol>@<id>/...   everything readable as seen up to generation 1100
+```
+
+`best/` shows each file's newest version, except when an older version (up to 64 back) is
+strictly better: a better category (intact > unverified > damaged > lost), fewer bad sectors
+among damaged versions, or real content when the newest version is empty (files truncated when
+disaster struck). Then it serves the newest such older version, with that version's size and
+timestamps. `README.txt` says how many files use an older version; `stat` in the shell shows it
+per file. Only files with nothing readable in any version are missing from `best/`.
+
+Nested subvolumes appear once, at the top level (`<name>@<id>`), not also inside their parent
+directory - otherwise every file in them would show up twice.
+
+`all/` and `history/` leave out files without recoverable data (zeros, or lost once
+classified); they stay in `lost/`. `--show-unreadable` lists them anyway.
+
+Category folders keep the original directory structure and show only directories that contain
+files of that category. They are empty until classification has finished.
+
+A generation view contains everything *seen* up to that generation, each file in its newest
+version at or before it. A file deleted before that generation still appears, because the
+index cannot know when a name stopped existing, only when it was last seen.
+
+Options: `--flat` (only `all/` at the root), `--at-gen N` (only generation N at the root),
+`--no-analyze`, `--refresh SECONDS`, `--show-unreadable`, `-x NAME` / `--no-exclude`.
+
+The mount is read-only and single-threaded; the kernel caches attributes, names and file pages
+(for `--refresh` seconds), so browsing large folders stays fast. The first listing after
+mounting loads the stored categories (about a second for 370k files).
+
+### One-shot listing
+
+```
+uv run mbkn-btrfs-rescue ls -l /_work@257/project
+```
+
+## 5. Restore
+
+```
+uv run mbkn-btrfs-rescue restore /_work@257/project ~/recovered
+uv run mbkn-btrfs-rescue restore --include damaged /_work@257/project ~/recovered
+uv run mbkn-btrfs-rescue restore --at-gen 1150 /_work@257/project/app.py ~/recovered/old
+```
+
+Each file is written in its **best version** - the same one `best/` shows (an older version
+when the newest is damaged, lost or empty); `--latest` writes the newest version instead.
+By default only **intact** and **unverified** files (judged by the version written) are
+written; `--include damaged`, `--include lost` or `--include all` add the others. Creates
+`DEST/<name>/...`, preserves mtimes and symlinks, never overwrites unless `--overwrite`,
+removes directories left empty by the filter, and writes `DEST/.mbkn-restore-<timestamp>.tsv`
+listing every file with its category, action (`written` / `skipped` / `exists`), sector counts
+and, for older versions, the generation used.
+
+Copying from the mount's `best/` gives the same bytes; see the README for when to prefer
+which.
+
+Restore to a **different disk** than the one being recovered.
+
+## Typical session for "recover my code, skip virtualenvs"
+
+```
+scripts/device-access.sh grant
+uv run mbkn-btrfs-rescue mount ~/rescue
+# browse ~/rescue/best/_work@257/... in a file manager, copy what you need, or:
+uv run mbkn-btrfs-rescue restore /_work@257 ~/recovered      # everything good, with a report
+```

@@ -1,0 +1,43 @@
+[project]
+name = "mbkn-btrfs-rescue"
+version = "0.2.0"
+description = "Read-only btrfs recovery: scan a device for tree blocks, index them in SQLite, browse and restore files"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "crc32c>=2.7",
+    "dissect-btrfs>=1.10",
+    "numpy>=2.2",
+    "xxhash>=3.5",
+]
+
+[project.optional-dependencies]
+fuse = ["mfusepy>=3.0"]
+
+[project.scripts]
+mbkn-btrfs-rescue = "mbkn_btrfs_rescue.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<1"]
+build-backend = "uv_build"
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

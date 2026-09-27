@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.sqlite
+*.sqlite-*
+*.img
+dist/
+
+# local config (machine specific)
+/mbkn-btrfs-rescue.toml

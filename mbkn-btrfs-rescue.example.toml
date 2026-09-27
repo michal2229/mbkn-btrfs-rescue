@@ -1,0 +1,22 @@
+# mbkn-btrfs-rescue configuration (example).
+#
+# Copy to ./mbkn-btrfs-rescue.toml (gitignored) or ~/.config/mbkn-btrfs-rescue/config.toml,
+# or run scripts/setup.sh which does it for you.
+# Lookup order: --config PATH, $MBKN_BTRFS_RESCUE_CONFIG, ./mbkn-btrfs-rescue.toml,
+# <repo>/mbkn-btrfs-rescue.toml, ~/.config/mbkn-btrfs-rescue/config.toml.
+# Command-line flags override values here. "~" and $VARS are expanded.
+
+# Device (or image file) to recover from. It is only ever opened read-only.
+# device = "/dev/mapper/luks-XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX"
+
+# Scratch space: test images, temporary files.
+tmp_dir = "~/.tmp/mbkn-btrfs-rescue"
+
+# Persistent state: the SQLite index built by `scan` / `extract`.
+cache_dir = "~/.cache/mbkn-btrfs-rescue"
+
+# Default database file name inside cache_dir.
+db_name = "index.sqlite"
+
+# Names hidden from browsing, restore and the FUSE mount (exact name match, any depth).
+exclude = [".venv", ".venv-tools"]
